@@ -61,42 +61,20 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
     // Get current market cap in USD (approximate, based on BNB price)
     // This is a view function for reference - actual pricing is in BNB
-    // Returns $5,000 when sold == 0, then calculates based on integral of price function
+    // Market cap = Current Price × Total Supply (curveAllocation)
     function getCurrentMarketCapUSD(uint256 bnbPriceUSD) external view returns (uint256) {
-        if (sold == 0) {
-            // Initial market cap is exactly $5,000
-            return 5000 * WAD; // $5,000 in WAD (18 decimals)
-        }
+        // Calculate current price at the current sold amount
+        uint256 currentPriceBNB = priceAt(sold); // Price in BNB (WAD scaled)
         
-        // Calculate market cap based on integral of price function
-        // Market cap = integral from 0 to sold of P(x) dx * bnbPriceUSD / WAD
-        // P(x) = P0 + m*x/curveAllocation
-        // Integral = P0*sold + (m*sold^2)/(2*curveAllocation)
-        // Then multiply by bnbPriceUSD/WAD to get USD
+        // Market cap = currentPriceBNB × curveAllocation × bnbPriceUSD / (WAD × WAD)
+        // currentPriceBNB is in WAD (18 decimals)
+        // curveAllocation is in raw token units (18 decimals)
+        // bnbPriceUSD is in WAD (18 decimals)
+        // Result: (WAD × WAD × WAD) / (WAD × WAD) = WAD (18 decimals) ✓
+        uint256 currentPriceUSD = (currentPriceBNB * bnbPriceUSD) / WAD; // Price in USD per token (WAD scaled)
+        uint256 marketCapUSD = (currentPriceUSD * curveAllocation) / WAD; // Total market cap in USD (WAD scaled)
         
-        uint256 integralTerm1 = (P0 * sold) / WAD; // P0*sold in wei
-        uint256 integralTerm2;
-        if (curveAllocation > 0) {
-            // (m * sold^2) / (2 * curveAllocation * WAD)
-            uint256 soldOverWad = sold / WAD;
-            if (soldOverWad > 0) {
-                uint256 mOverWad = m / WAD;
-                uint256 soldSquaredOverCurveAlloc = (sold * sold) / curveAllocation;
-                integralTerm2 = (mOverWad * soldSquaredOverCurveAlloc) / (2 * WAD);
-            }
-        }
-        
-        uint256 totalCostBNB = integralTerm1 + integralTerm2; // Total BNB spent (in wei)
-        // Convert to USD: totalCostBNB * bnbPriceUSD / WAD
-        uint256 marketCapUSD = (totalCostBNB * bnbPriceUSD) / WAD;
-        
-        // Add remaining tokens at current price
-        uint256 remainingTokens = token.balanceOf(address(this));
-        uint256 currentPriceBNB = priceAt(sold);
-        uint256 currentPriceUSD = (currentPriceBNB * bnbPriceUSD) / WAD;
-        uint256 remainingValueUSD = (currentPriceUSD * remainingTokens) / WAD;
-        
-        return marketCapUSD + remainingValueUSD;
+        return marketCapUSD;
     }
 
     // PRICE HELPERS
