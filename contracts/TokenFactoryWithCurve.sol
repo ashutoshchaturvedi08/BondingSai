@@ -2,33 +2,37 @@
 pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./MemeToken.sol";
 import "./BondingCurve.sol";
 
 contract TokenFactoryWithCurve is Ownable {
+    using SafeERC20 for IERC20;
+
     address public immutable feeRecipient;
-    address public bondingCurveImplementation; // Can be updated for upgrades
-    
+
+    // LOT-12 (Audit): Bounds for P0 and m to prevent free/flat curves and overflow
+    uint256 public constant MIN_P0 = 1;
+    uint256 public constant MAX_P0 = 1e18;
+    uint256 public constant MIN_M = 1;
+    uint256 public constant MAX_M = 100e18;
+
     event TokenCreated(address tokenAddress, address creator, string name, string symbol);
     event BondingCurveCreated(address tokenAddress, address curveAddress);
-    
+
     constructor(address _feeRecipient) {
         require(_feeRecipient != address(0), "feeRecipient 0");
         feeRecipient = _feeRecipient;
         _transferOwnership(msg.sender);
     }
-    
-    function setBondingCurveImplementation(address _implementation) external onlyOwner {
-        bondingCurveImplementation = _implementation;
-    }
-    
-    // Create token with bonding curve
-    // 800M tokens go to bonding curve, 200M tokens go to creator for liquidity
-    function createTokenWithBondingCurve(
+
+    /// @dev LOT-07 (Audit): Internal implementation so msg.sender is preserved when called from createDefaultTokenWithCurve
+    function _createTokenWithBondingCurve(
         string memory _name,
         string memory _symbol,
         uint8 _decimals,
-        uint256 _totalSupply, // Total supply (1 billion)
+        uint256 _totalSupply,
         string memory _description,
         string memory _logoURL,
         string memory _website,
@@ -36,25 +40,30 @@ contract TokenFactoryWithCurve is Ownable {
         string memory _twitter,
         string[] memory _projectCategories,
         uint256[] memory _buyOptions,
-        uint256 _P0_wad, // Initial price in BNB wei (WAD scaled)
-        uint256 _m_wad,  // Slope in BNB wei per token (WAD scaled)
-        uint256 /* _bnbPriceUSD */ // Current BNB price in USD (for validation - reserved for future use)
-    ) external returns (address tokenAddress, address curveAddress) {
+        uint256 _P0_wad,
+        uint256 _m_wad
+    ) internal returns (address tokenAddress, address curveAddress) {
         require(bytes(_name).length > 0, "Name cannot be empty");
         require(bytes(_symbol).length > 0, "Symbol cannot be empty");
         require(_decimals > 0, "Decimals must be greater than 0");
         require(_totalSupply > 0, "Total supply must be greater than 0");
-        
-        // Calculate curve allocation (80% of total supply = 800M for 1B total)
-        uint256 curveAllocation = (_totalSupply * 80) / 100; // 800M tokens
+        // LOT-19 (Audit): Bonding curve math assumes 18-decimal tokens; enforce in all factory paths
+        require(_decimals == 18, "bonding curves require 18 decimals");
+        require(_P0_wad >= MIN_P0 && _P0_wad <= MAX_P0, "P0 out of range");
+        require(_m_wad >= MIN_M && _m_wad <= MAX_M, "m out of range");
+
+        // LOT-03 (Audit): Scale curveAllocation by token decimals (was 1e18 too small)
+        uint256 rawTotalSupply = _totalSupply * (10 ** _decimals);
+        uint256 curveAllocation = (rawTotalSupply * 80) / 100;
+        uint256 creatorAllocation = rawTotalSupply - curveAllocation;
         require(curveAllocation > 0, "curveAllocation must be > 0");
-        
-        // Create token
+
+        // LOT-02 (Audit): Mint to factory so we can transfer; then distribute atomically
         MemeToken token = new MemeToken(
             _name,
             _symbol,
             _decimals,
-            msg.sender,
+            address(this),
             _totalSupply,
             _description,
             _logoURL,
@@ -64,32 +73,54 @@ contract TokenFactoryWithCurve is Ownable {
             _projectCategories,
             _buyOptions
         );
-        
         tokenAddress = address(token);
-        
-        // Create bonding curve
+
         BondingCurveBNB curve = new BondingCurveBNB(
             tokenAddress,
             _P0_wad,
             _m_wad,
             curveAllocation,
             feeRecipient,
-            msg.sender // Owner of curve is token creator
+            msg.sender
         );
-        
         curveAddress = address(curve);
-        
-        // Transfer curve allocation tokens to bonding curve
-        // Token creator owns all tokens, so we transfer from creator's balance
-        require(token.transfer(curveAddress, curveAllocation), "transfer failed");
-        
+
+        IERC20(tokenAddress).safeTransfer(curveAddress, curveAllocation);
+        IERC20(tokenAddress).safeTransfer(msg.sender, creatorAllocation);
+
+        token.transferOwnership(msg.sender);
+        // LOT-05 (Audit): Exclude bonding curve from anti-sniper so curve isn't rate-limited globally
+        token.setExcludedFromLimits(curveAddress, true);
+
         emit TokenCreated(tokenAddress, msg.sender, _name, _symbol);
         emit BondingCurveCreated(tokenAddress, curveAddress);
-        
         return (tokenAddress, curveAddress);
     }
-    
-    // Create default token with bonding curve (1B supply, 18 decimals)
+
+    function createTokenWithBondingCurve(
+        string memory _name,
+        string memory _symbol,
+        uint8 _decimals,
+        uint256 _totalSupply,
+        string memory _description,
+        string memory _logoURL,
+        string memory _website,
+        string memory _github,
+        string memory _twitter,
+        string[] memory _projectCategories,
+        uint256[] memory _buyOptions,
+        uint256 _P0_wad,
+        uint256 _m_wad,
+        uint256 /* _bnbPriceUSD */
+    ) external returns (address tokenAddress, address curveAddress) {
+        return _createTokenWithBondingCurve(
+            _name, _symbol, _decimals, _totalSupply,
+            _description, _logoURL, _website, _github, _twitter,
+            _projectCategories, _buyOptions, _P0_wad, _m_wad
+        );
+    }
+
+    /// @dev LOT-07 (Audit): Call internal to preserve msg.sender (no external self-call)
     function createDefaultTokenWithCurve(
         string memory _name,
         string memory _symbol,
@@ -97,21 +128,11 @@ contract TokenFactoryWithCurve is Ownable {
         uint256 _m_wad,
         uint256 _bnbPriceUSD
     ) external returns (address tokenAddress, address curveAddress) {
-        return this.createTokenWithBondingCurve(
-            _name,
-            _symbol,
-            18,
-            1_000_000_000, // 1 billion
-            "",
-            "",
-            "",
-            "",
-            "",
-            new string[](0),
-            new uint256[](0),
-            _P0_wad,
-            _m_wad,
-            _bnbPriceUSD
+        return _createTokenWithBondingCurve(
+            _name, _symbol, 18, 1_000_000_000,
+            "", "", "", "", "",
+            new string[](0), new uint256[](0),
+            _P0_wad, _m_wad
         );
     }
 }

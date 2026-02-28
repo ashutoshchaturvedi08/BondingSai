@@ -2,10 +2,13 @@
 pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./MemeToken.sol";
 import "./BondingCurveFactory.sol";
 
 contract TokenFactory is Ownable {
+    using SafeERC20 for IERC20;
     BondingCurveFactory public bondingCurveFactory;
     
     event TokenCreated(address tokenAddress, address creator, string name, string symbol);
@@ -114,6 +117,7 @@ contract TokenFactory is Ownable {
      * @return tokenAddress Address of created token
      * @return bondingCurveAddress Address of created bonding curve
      */
+    /// @dev LOT-11 (Audit): Mint to factory and fund curve atomically; LOT-19: bonding curves require 18 decimals
     function createTokenWithBondingCurve(
         string memory _name,
         string memory _symbol,
@@ -129,39 +133,34 @@ contract TokenFactory is Ownable {
         require(bytes(_name).length > 0, "Name cannot be empty");
         require(bytes(_symbol).length > 0, "Symbol cannot be empty");
         require(_decimals > 0, "Decimals must be greater than 0");
-        
-        // Create token with 1 billion supply
-        uint256 totalSupply = 1_000_000_000; // 1 billion
-        
+        require(_decimals == 18, "bonding curves require 18 decimals");
+
+        uint256 totalSupply = 1_000_000_000;
+        uint256 rawTotalSupply = totalSupply * (10 ** _decimals);
+        uint256 curveAllocation = (rawTotalSupply * 80) / 100;
+        uint256 creatorAllocation = rawTotalSupply - curveAllocation;
+
         MemeToken token = new MemeToken(
-            _name,
-            _symbol,
-            _decimals,
-            msg.sender,
+            _name, _symbol, _decimals,
+            address(this),
             totalSupply,
-            _description,
-            _logoURL,
-            _website,
-            _github,
-            _twitter,
-            _projectCategories,
-            _buyOptions
+            _description, _logoURL, _website, _github, _twitter,
+            _projectCategories, _buyOptions
         );
-        
         tokenAddress = address(token);
-        
-        // Create bonding curve
+
         bondingCurveAddress = bondingCurveFactory.createBondingCurve(
             tokenAddress,
             _decimals,
             msg.sender
         );
-        
-        // Note: Token creator owns all tokens initially (1B tokens)
-        // Creator needs to manually deposit 800M tokens to the bonding curve after creation
-        // This can be done by calling: bondingCurve.depositCurveTokens(800_000_000 * 10^decimals)
-        // The remaining 200M tokens stay with creator for liquidity provision
-        
+
+        IERC20(tokenAddress).safeTransfer(bondingCurveAddress, curveAllocation);
+        IERC20(tokenAddress).safeTransfer(msg.sender, creatorAllocation);
+
+        token.transferOwnership(msg.sender);
+        token.setExcludedFromLimits(bondingCurveAddress, true);
+
         emit TokenWithBondingCurveCreated(
             tokenAddress,
             bondingCurveAddress,

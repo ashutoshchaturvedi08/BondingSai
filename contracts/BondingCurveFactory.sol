@@ -18,7 +18,8 @@ contract BondingCurveFactory is Ownable {
     uint256 public constant START_MARKET_CAP_USD = 5000; // $5,000 (initial market cap at start)
     uint256 public constant END_MARKET_CAP_USD = 76963; // ~$76,963 (target market cap at end, matching four.meme)
     uint256 public constant CURVE_TOKENS = 1_000_000_000; // 1B tokens total (800M tradable, 200M locked for DEX)
-    uint256 public constant TRADABLE_TOKENS = 800_000_000; // 800M tokens available for trading
+    // LOT-15 (Audit): Removed unused TRADABLE_TOKENS constant
+    uint256 public constant STALENESS_THRESHOLD = 3600; // LOT-04 (Audit): 1 hour - BNB/USD feed heartbeat ~60s
     // Target initial price in BNB (matching four.meme: 0.000000005798 BNB per token)
     // From four.meme expected amounts:
     //   - 0.00099 BNB → 170,734 tokens → P0 ≈ 5.798e-9
@@ -55,27 +56,29 @@ contract BondingCurveFactory is Ownable {
 
     /**
      * @notice Get latest BNB price from Chainlink Price Feed
+     * LOT-04 (Audit): Staleness validation via updatedAt; roundId check; no answeredInRound (deprecated)
      * @return price BNB price in USD with 18 decimals (WAD)
      */
     function getLatestBNBPrice() public view returns (uint256 price) {
         (
-            /* uint80 roundID */,
+            uint80 roundId,
             int256 rawPrice,
             /* uint startedAt */,
-            /* uint timeStamp */,
+            uint256 updatedAt,
             /* uint80 answeredInRound */
         ) = bnbPriceFeed.latestRoundData();
-        
+
         require(rawPrice > 0, "Invalid price");
-        
-        // Chainlink returns price with 8 decimals, convert to 18 decimals (WAD)
-        // price = rawPrice * 10^(18-8) = rawPrice * 10^10
-        // WAD = 1e18, so we need to multiply by 10^10 to go from 8 to 18 decimals
+        require(roundId != 0, "Invalid round");
+        require(updatedAt != 0 && updatedAt <= block.timestamp, "Invalid timestamp");
+        require(block.timestamp - updatedAt <= STALENESS_THRESHOLD, "Stale price");
+
         price = uint256(rawPrice) * (10 ** 10);
     }
 
     /**
      * @notice Calculate bonding curve parameters to match four.meme pricing exactly
+     * LOT-09 (Audit): bnbPriceUSD is fetched and returned for off-chain use; P0/m are BNB-denominated (fixed targets), not dynamically derived from USD here.
      * @dev Uses multiple target points to calculate m accurately:
      *      - 0.00099 BNB → 170,734 tokens
      *      - 0.0099 BNB → 1,704,902 tokens
@@ -195,6 +198,8 @@ contract BondingCurveFactory is Ownable {
     ) external returns (address bondingCurve) {
         require(_token != address(0), "token 0");
         require(_owner != address(0), "owner 0");
+        // LOT-19 (Audit): Bonding curve math assumes 18-decimal tokens
+        require(_tokenDecimals == 18, "bonding curves require 18 decimals");
 
         // Calculate curve parameters using real-time BNB price from Chainlink
         (uint256 p0_wad, uint256 m_wad, uint256 bnbPriceUSD) = calculateCurveParams();

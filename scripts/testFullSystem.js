@@ -456,7 +456,8 @@ async function main() {
   }
   
   try {
-    const buyTx = await bondingCurve.connect(user1).buyWithBNB(0, { value: finalBuyAmount });
+    const deadline = Math.floor(Date.now() / 1000) + 300;
+    const buyTx = await bondingCurve.connect(user1).buyWithBNB(0, deadline, { value: finalBuyAmount });
     const buyReceipt = await buyTx.wait();
     console.log("  ✅ Buy successful! Block:", buyReceipt.blockNumber);
 
@@ -615,7 +616,8 @@ async function main() {
 
   // Execute sell
   console.log("  ⏳ Executing sell...");
-  const sellTx = await bondingCurve.connect(user1).sell(sellAmount, 0);
+  const sellDeadline = Math.floor(Date.now() / 1000) + 300;
+  const sellTx = await bondingCurve.connect(user1).sell(sellAmount, 0, sellDeadline);
   const sellReceipt = await sellTx.wait();
   console.log("  ✅ Sell successful! Block:", sellReceipt.blockNumber);
 

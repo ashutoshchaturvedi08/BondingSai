@@ -86,9 +86,10 @@ const bondingCurveAddress = "YOUR_BONDING_CURVE_ADDRESS";
 const BondingCurve = await ethers.getContractFactory("BondingCurveBNB");
 const bondingCurve = await BondingCurve.attach(bondingCurveAddress);
 
-// Buy with 0.00001 BNB
+// Buy with 0.00001 BNB (deadline = 5 min from now, per LOT-21)
 const buyAmount = ethers.parseEther("0.00001");
-const buyTx = await bondingCurve.buyWithBNB(0, { value: buyAmount });
+const deadline = Math.floor(Date.now() / 1000) + 300;
+const buyTx = await bondingCurve.buyWithBNB(0, deadline, { value: buyAmount });
 await buyTx.wait();
 console.log("✅ Buy successful!");
 
@@ -124,8 +125,9 @@ const sellAmount = tokenBalance / 2n;
 // Approve bonding curve
 await token.approve(bondingCurveAddress, sellAmount);
 
-// Execute sell
-const sellTx = await bondingCurve.sell(sellAmount, 0);
+// Execute sell (minQuoteOut = 0, deadline = 5 min)
+const sellDeadline = Math.floor(Date.now() / 1000) + 300;
+const sellTx = await bondingCurve.sell(sellAmount, 0, sellDeadline);
 await sellTx.wait();
 console.log("✅ Sell successful!");
 

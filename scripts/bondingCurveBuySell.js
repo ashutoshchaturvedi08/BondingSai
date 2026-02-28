@@ -27,8 +27,9 @@ async function main() {
     const quote = await bondingCurve.tokensForQuote(sold, bnbAmount);
     console.log("Estimated tokens out:", hre.ethers.formatEther(quote));
 
-    // Execute buy
-    const tx = await bondingCurve.buyWithBNB(0, { value: bnbAmount }); // minTokensOut = 0 for now
+    // Execute buy (LOT-21: deadline required; use 5 min from now)
+    const deadline = Math.floor(Date.now() / 1000) + 300;
+    const tx = await bondingCurve.buyWithBNB(0, deadline, { value: bnbAmount });
     console.log("Transaction hash:", tx.hash);
     const receipt = await tx.wait();
     console.log("✅ Buy successful! Block:", receipt.blockNumber);
@@ -79,8 +80,9 @@ async function main() {
     const quote = await bondingCurve.sellQuoteFor(sold, tokenAmount);
     console.log("Estimated BNB out:", hre.ethers.formatEther(quote));
 
-    // Execute sell
-    const tx = await bondingCurve.sell(tokenAmount, 0); // minQuoteOut = 0 for now
+    // Execute sell (LOT-01/LOT-21: minQuoteOut and deadline required)
+    const deadline = Math.floor(Date.now() / 1000) + 300;
+    const tx = await bondingCurve.sell(tokenAmount, 0, deadline);
     console.log("Transaction hash:", tx.hash);
     const receipt = await tx.wait();
     console.log("✅ Sell successful! Block:", receipt.blockNumber);

@@ -87,15 +87,15 @@ contract MemeToken is Ownable, ReentrancyGuard {
         emit Transfer(address(0), _creator, totalSupply);
     }
     
-    // ERC20 approve function
+    // LOT-10 (Audit): Standard EIP-20 approve; known race if spender front-runs. Consider EIP-2612 permit() for gasless approvals.
     function approve(address spender, uint256 value) external returns (bool) {
         allowance[msg.sender][spender] = value;
         emit Approval(msg.sender, spender, value);
         return true;
     }
-    
-    // ERC20 transferFrom function
-    function transferFrom(address from, address to, uint256 value) external nonReentrant returns (bool) {
+
+    // LOT-16 (Audit): Removed nonReentrant — no external calls in transfer; saves gas and allows use inside other nonReentrant flows
+    function transferFrom(address from, address to, uint256 value) external returns (bool) {
         require(balanceOf[from] >= value, "Insufficient balance");
         require(to != address(0), "Transfer to zero address");
         
@@ -105,35 +105,34 @@ contract MemeToken is Ownable, ReentrancyGuard {
             allowance[from][msg.sender] -= value;
         }
         
-        // Apply anti-sniper checks if enabled
+        // LOT-26 (Audit): Only update lastTransferTime when actively enforcing anti-sniper
         if (antiSniperEnabled && !excludedFromLimits[from]) {
             require(value <= maxTransaction, "Transfer > maxTransaction");
             require(balanceOf[to] + value <= maxWallet, "Recipient > maxWallet");
             require(block.timestamp - lastTransferTime[from] >= cooldownPeriod, "Cooldown active");
+            lastTransferTime[from] = block.timestamp;
         }
-        
+
         balanceOf[from] -= value;
         balanceOf[to] += value;
-        lastTransferTime[from] = block.timestamp;
         
         emit Transfer(from, to, value);
         return true;
     }
     
-    // Anti-sniper transfer function
-    function transfer(address to, uint256 value) external nonReentrant returns (bool) {
+    function transfer(address to, uint256 value) external returns (bool) {
         require(balanceOf[msg.sender] >= value, "Insufficient balance");
         require(to != address(0), "Transfer to zero address");
-        
+
         if (antiSniperEnabled && !excludedFromLimits[msg.sender]) {
             require(value <= maxTransaction, "Transfer > maxTransaction");
             require(balanceOf[to] + value <= maxWallet, "Recipient > maxWallet");
             require(block.timestamp - lastTransferTime[msg.sender] >= cooldownPeriod, "Cooldown active");
+            lastTransferTime[msg.sender] = block.timestamp;
         }
-        
+
         balanceOf[msg.sender] -= value;
         balanceOf[to] += value;
-        lastTransferTime[msg.sender] = block.timestamp;
         
         emit Transfer(msg.sender, to, value);
         return true;
@@ -155,8 +154,8 @@ contract MemeToken is Ownable, ReentrancyGuard {
         maxWallet = _maxWallet * (10 ** decimals);
         maxTransaction = _maxTransaction * (10 ** decimals);
         cooldownPeriod = _cooldownPeriod;
-        
-        emit AntiSniperSettingsUpdated(_antiSniperEnabled, _maxWallet, _maxTransaction, _cooldownPeriod);
+        // LOT-23 (Audit): Emit scaled (stored) values so off-chain consumers see enforced limits
+        emit AntiSniperSettingsUpdated(_antiSniperEnabled, maxWallet, maxTransaction, _cooldownPeriod);
     }
     
     function updateMetadata(

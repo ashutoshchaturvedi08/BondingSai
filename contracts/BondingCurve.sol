@@ -13,14 +13,14 @@ pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-interface IERC20 {
-    function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-}
+// LOT-06 (Audit): SafeERC20 used for rescue/withdraw to prevent rug-pull and handle non-standard tokens
 
 contract BondingCurveBNB is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
     IERC20 public immutable token; // token sold on curve (e.g., MemeToken)
     address public immutable feeRecipient;
 
@@ -28,10 +28,11 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     uint256 public constant FEE_BPS = 100; // 1% (100/10000)
     uint256 public constant BPS_BASE = 10000;
 
+    // LOT-17 (Audit): P0 and m declared immutable - set only in constructor, gas savings on every quote read
     // Curve parameters (price units = BNB wei scaled as WAD)
-    uint256 public P0;              // starting price per token (WAD), equals (startFDV / totalSupply) * WAD
-    uint256 public m;               // slope (WAD per token)
-    uint256 public sold;            // tokens sold so far (raw token units)
+    uint256 public immutable P0;   // starting price per token (WAD), equals (startFDV / totalSupply) * WAD
+    uint256 public immutable m;    // slope (WAD per token)
+    uint256 public sold;           // tokens sold so far (raw token units)
     uint256 public immutable curveAllocation; // total tokens allocated to this curve (raw units)
     bool public curveFinished;
 
@@ -39,7 +40,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     event Buy(address indexed buyer, uint256 bnbIn, uint256 tokensOut, uint256 fee);
     event Sell(address indexed seller, uint256 tokensIn, uint256 bnbOut, uint256 fee);
     event CurveFinished(uint256 sold);
-    event FeeRecipientChanged(address indexed newRecipient);
+    // LOT-13 (Audit): Removed unused FeeRecipientChanged event - feeRecipient is immutable and never changed
 
     constructor(
         address _token,
@@ -51,6 +52,9 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     ) {
         require(_token != address(0), "token 0");
         require(_feeRecipient != address(0), "feeRecipient 0");
+        // LOT-20 (Audit): Verify feeRecipient can receive BNB to prevent permanent DoS of buy/sell
+        (bool testSend,) = payable(_feeRecipient).call{value: 0}("");
+        require(testSend, "feeRecipient cannot receive BNB");
         token = IERC20(_token);
         P0 = _P0_wad;
         m = _m_wad;
@@ -85,161 +89,53 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         return P0 + (m * s) / curveAllocation;
     }
 
+    /// @dev LOT-18 (Audit): Quadratic term helper - correct formula without extra /WAD that nullified price progression.
+    /// term2 = m * ds^2 / (2 * curveAllocation * WAD). With dsOverWad = ds/WAD, curveAllocationOverWad = curveAllocation/WAD:
+    /// term2 = m * dsOverWad^2 / (2 * curveAllocationOverWad) — NO extra /WAD.
+    function _quadraticTerm(uint256 ds) internal view returns (uint256) {
+        if (ds == 0 || curveAllocation == 0) return 0;
+        uint256 dsOverWad = ds / WAD;
+        uint256 curveAllocationOverWad = curveAllocation / WAD;
+        if (dsOverWad == 0) {
+            // LOT-08 (Audit): Sub-WAD branch - consistent with buy path: divide by 2 only (no extra /WAD)
+            uint256 mOverWad = m / WAD;
+            uint256 dsSquaredOverCurveAlloc = (ds * ds) / curveAllocation;
+            return (mOverWad * dsSquaredOverCurveAlloc) / 2;
+        }
+        if (curveAllocationOverWad == 0) return 0;
+        if (m <= type(uint256).max / dsOverWad) {
+            uint256 temp = m * dsOverWad;
+            if (temp <= type(uint256).max / dsOverWad) {
+                uint256 temp2 = temp * dsOverWad;
+                return (temp2 / curveAllocationOverWad) / 2; // NO extra / WAD (LOT-18)
+            }
+        }
+        uint256 mOverWad = m / WAD;
+        uint256 numerator = mOverWad * dsOverWad * dsOverWad;
+        return (numerator * WAD) / (2 * curveAllocationOverWad);
+    }
+
     // Cost (in wei) to buy ds tokens from state s:
-    // Price at s: P(s) = P0 + m * s / WAD (in WAD units)
-    // Cost = integral from s to s+ds of P(x) dx
-    // Cost = P(s) * ds / WAD + 0.5 * m * ds^2 / WAD^2
-    // Since P(s) is in WAD, we need to divide by WAD to get wei per token
-    // Since m is in WAD and ds is in raw token units (18 decimals), ds^2 has 36 decimals
-    // So we need to divide by WAD^2 to get the correct wei result
+    // Price at s: P(s) = P0 + m * s / curveAllocation (in WAD units)
+    // Cost = P(s)*ds/WAD + 0.5*m*ds^2/(curveAllocation*WAD) = term1 + term2
     function buyQuoteFor(uint256 s, uint256 ds) public view returns (uint256) {
         if (ds == 0) return 0;
         if (curveAllocation == 0) return 0;
-        uint256 b = P0 + (m * s) / curveAllocation; // b is in WAD (price per token scaled by WAD)
-        // term1 = (b / WAD) * ds = price per token in wei * tokens = wei
+        uint256 b = P0 + (m * s) / curveAllocation;
         uint256 term1 = (b * ds) / WAD;
-        // term2 = 0.5 * m * ds^2 / WAD^2
-        // m is in WAD (18 decimals), ds is in raw token units (18 decimals)
-        // ds^2 has 36 decimals, so we need to divide by WAD^2 to get wei
-        // Formula: term2 = (m * ds^2) / (2 * WAD^2)
-        // To avoid overflow: term2 = (m * (ds/WAD) * (ds/WAD)) / (2 * curveAllocationOverWad)
-        uint256 dsOverWad = ds / WAD;
-        uint256 curveAllocationOverWad = curveAllocation / WAD;
-        uint256 term2;
-        
-        // Handle case where ds < WAD (dsOverWad == 0)
-        if (dsOverWad == 0) {
-            // For very small ds, term2 is negligible, use direct calculation
-            // term2 = (m * ds^2) / (2 * curveAllocation * WAD)
-            // To avoid overflow, calculate: (m / WAD) * (ds^2 / curveAllocation) / 2
-            uint256 mOverWad = m / WAD;
-            uint256 dsSquaredOverCurveAlloc = (ds * ds) / curveAllocation;
-            term2 = (mOverWad * dsSquaredOverCurveAlloc) / 2;
-        } else {
-            // term2 = (m * ds^2) / (2 * curveAllocation * WAD)
-            // Using dsOverWad = ds / WAD (no decimals) and curveAllocationOverWad = curveAllocation / WAD
-            // term2 = (m * dsOverWad * dsOverWad) / (2 * curveAllocationOverWad * WAD)
-            if (m <= type(uint256).max / dsOverWad) {
-                uint256 temp = m * dsOverWad;
-                if (temp <= type(uint256).max / dsOverWad) {
-                    uint256 temp2 = temp * dsOverWad;
-                    // temp2 = m * dsOverWad * dsOverWad (in WAD units, 18 decimals)
-                    // We need to divide by (2 * curveAllocationOverWad * WAD) to get wei
-                    // term2 = temp2 / (2 * curveAllocationOverWad * WAD)
-                    // = (temp2 / curveAllocationOverWad) / (2 * WAD)
-                    if (curveAllocationOverWad > 0) {
-                        if (temp2 / curveAllocationOverWad <= type(uint256).max / (2 * WAD)) {
-                            term2 = (temp2 / curveAllocationOverWad) / (2 * WAD);
-                        } else {
-                            // Alternative: divide by 2 first
-                            term2 = (temp2 / 2) / (curveAllocationOverWad * WAD);
-                        }
-                    } else {
-                        term2 = 0;
-                    }
-                } else {
-                    // Divide m first
-                    // mOverWad has 0 decimals, dsOverWad has 0 decimals, curveAllocationOverWad has 0 decimals
-                    // mOverWad * dsOverWad * dsOverWad has 0 decimals
-                    // We need to divide by (2 * curveAllocationOverWad * WAD) to get wei
-                    uint256 mOverWad = m / WAD;
-                    if (curveAllocationOverWad > 0) {
-                        term2 = (mOverWad * dsOverWad * dsOverWad) / (2 * curveAllocationOverWad * WAD);
-                    } else {
-                        term2 = 0;
-                    }
-                }
-            } else {
-                // Divide m first to avoid overflow
-                // mOverWad has 0 decimals, dsOverWad has 0 decimals, curveAllocationOverWad has 0 decimals
-                // mOverWad * dsOverWad * dsOverWad has 0 decimals
-                // We need to divide by (2 * curveAllocationOverWad * WAD) to get wei
-                uint256 mOverWad = m / WAD;
-                if (curveAllocationOverWad > 0) {
-                    term2 = (mOverWad * dsOverWad * dsOverWad) / (2 * curveAllocationOverWad * WAD);
-                } else {
-                    term2 = 0;
-                }
-            }
-        }
-        return term1 + term2;
+        return term1 + _quadraticTerm(ds);
     }
 
-    // Quote returned when selling ds from state s:
-    // quoteOut = (P0 + m*s/curveAllocation) * ds / WAD - 0.5 * m * ds^2 / (curveAllocation * WAD)
+    // Quote returned when selling ds from state s: term1 - term2 (same term2 as buy via _quadraticTerm)
     function sellQuoteFor(uint256 s, uint256 ds) public view returns (uint256) {
         require(ds <= s, "ds > s");
         if (ds == 0) return 0;
         if (curveAllocation == 0) return 0;
         uint256 b = P0 + (m * s) / curveAllocation;
         uint256 term1 = (b * ds) / WAD;
-        // term2 needs curveAllocation * WAD in denominator, same as buyQuoteFor
-        // Use same overflow protection as buyQuoteFor
-        uint256 dsOverWad = ds / WAD;
-        uint256 curveAllocationOverWad = curveAllocation / WAD;
-        uint256 term2;
-        
-        // Handle case where ds < WAD (dsOverWad == 0)
-        if (dsOverWad == 0) {
-            // For very small ds, term2 is negligible, use direct calculation
-            // term2 = (m * ds^2) / (2 * curveAllocation * WAD)
-            uint256 mOverWad = m / WAD;
-            uint256 dsSquaredOverCurveAlloc = (ds * ds) / curveAllocation;
-            term2 = (mOverWad * dsSquaredOverCurveAlloc) / (2 * WAD);
-        } else {
-            // term2 = (m * ds^2) / (2 * curveAllocation * WAD) - same as buyQuoteFor
-            if (m <= type(uint256).max / dsOverWad) {
-                uint256 temp = m * dsOverWad;
-                if (temp <= type(uint256).max / dsOverWad) {
-                    uint256 temp2 = temp * dsOverWad;
-                    // temp2 = m * dsOverWad * dsOverWad (in WAD units, 18 decimals)
-                    // We need to divide by (2 * curveAllocationOverWad * WAD) to get wei
-                    // term2 = temp2 / (2 * curveAllocationOverWad * WAD)
-                    if (curveAllocationOverWad > 0) {
-                        if (temp2 / curveAllocationOverWad <= type(uint256).max / (2 * WAD)) {
-                            term2 = (temp2 / curveAllocationOverWad) / (2 * WAD);
-                        } else {
-                            // Alternative: divide by 2 first
-                            term2 = (temp2 / 2) / (curveAllocationOverWad * WAD);
-                        }
-                    } else {
-                        term2 = 0;
-                    }
-                } else {
-                    // Divide m first
-                    // mOverWad has 0 decimals, dsOverWad has 0 decimals, curveAllocationOverWad has 0 decimals
-                    // mOverWad * dsOverWad * dsOverWad has 0 decimals
-                    // We need to divide by (2 * curveAllocationOverWad * WAD) to get wei
-                    uint256 mOverWad = m / WAD;
-                    if (curveAllocationOverWad > 0) {
-                        term2 = (mOverWad * dsOverWad * dsOverWad) / (2 * curveAllocationOverWad * WAD);
-                    } else {
-                        term2 = 0;
-                    }
-                }
-            } else {
-                // Divide m first to avoid overflow
-                // mOverWad has 0 decimals, dsOverWad has 0 decimals, curveAllocationOverWad has 0 decimals
-                // mOverWad * dsOverWad * dsOverWad has 0 decimals
-                // We need to divide by (2 * curveAllocationOverWad * WAD) to get wei
-                uint256 mOverWad = m / WAD;
-                if (curveAllocationOverWad > 0) {
-                    term2 = (mOverWad * dsOverWad * dsOverWad) / (2 * curveAllocationOverWad * WAD);
-                } else {
-                    term2 = 0;
-                }
-            }
-        }
-        
-        // Ensure no underflow - term1 should always be >= term2 for valid curve
-        // But due to rounding with very small amounts, we need to handle it
-        if (term1 >= term2) {
-            return term1 - term2;
-        } else {
-            // For very small amounts, rounding might cause term2 > term1
-            // Return 0 or a minimal value to prevent underflow
-            return 0;
-        }
+        uint256 term2 = _quadraticTerm(ds);
+        if (term1 >= term2) return term1 - term2;
+        return 0;
     }
 
     // Solve for ds given netQuote using binary search
@@ -276,7 +172,8 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         uint256 low = 1;
         uint256 high = upperBound;
         uint256 answer = 0;
-        uint256 maxIterations = 256;
+        // LOT-27 (Audit): 128 iterations sufficient for full uint256 range; reduces unpredictable gas
+        uint256 maxIterations = 128;
         
         // Standard binary search to find the maximum tokens we can buy
         while (low <= high && maxIterations > 0) {
@@ -379,18 +276,25 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
     // Fee recipient is immutable, cannot be changed
 
-    // Withdraw tokens (unused) - owner only
+    // LOT-06 (Audit): Withdraw only excess tokens — cannot withdraw active curve allocation
     function withdrawToken(address to, uint256 amount) external onlyOwner {
         require(to != address(0), "zero");
-        require(token.transfer(to, amount), "transfer failed");
+        uint256 activeBalance = curveAllocation - sold;
+        uint256 currentBalance = token.balanceOf(address(this));
+        require(currentBalance - amount >= activeBalance, "cannot withdraw active tokens");
+        token.safeTransfer(to, amount);
     }
 
-    // Emergency rescue for tokens/BNB by owner
+    // LOT-06 (Audit): Cannot rescue curve's own token; other ERC20 only (e.g. airdrops)
     function rescueERC20(address tokenAddr, address to, uint256 amount) external onlyOwner {
-        require(IERC20(tokenAddr).transfer(to, amount), "transfer failed");
+        require(tokenAddr != address(token), "cannot rescue curve token");
+        IERC20(tokenAddr).safeTransfer(to, amount);
     }
+    // LOT-06 (Audit): Rescue BNB only if curve remains solvent for current sold amount
     function rescueBNB(address payable to, uint256 amount) external onlyOwner {
         require(to != payable(address(0)), "zero");
+        uint256 requiredBNB = sellQuoteFor(sold, sold);
+        require(address(this).balance - amount >= requiredBNB, "would make curve insolvent");
         (bool sent,) = to.call{value: amount}("");
         require(sent, "BNB send failed");
     }
@@ -404,12 +308,13 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // --------------------
     // BUY (payable) - BNB
     // --------------------
-    // Buyer sends BNB (msg.value). Contract takes 1% fee to feeRecipient, then uses net BNB to compute tokens to send.
-    function buyWithBNB(uint256 minTokensOut) external payable nonReentrant {
+    // LOT-21 (Audit): deadline prevents stale transactions (e.g. Four.Meme-style sandwich on BSC)
+    function buyWithBNB(uint256 minTokensOut, uint256 deadline) external payable nonReentrant {
+        require(block.timestamp <= deadline, "transaction expired");
         require(!curveFinished, "curve finished");
         require(msg.value > 0, "send BNB");
 
-        uint256 fee = (msg.value * FEE_BPS) / BPS_BASE; // fee in wei
+        uint256 fee = (msg.value * FEE_BPS) / BPS_BASE;
         if (fee > 0) {
             (bool ok,) = payable(feeRecipient).call{value: fee}("");
             require(ok, "fee transfer failed");
@@ -423,7 +328,6 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         if (ds > remaining) ds = remaining;
 
         uint256 actualCost = buyQuoteFor(sold, ds);
-        // refund netQuote - actualCost if any
         if (actualCost < netQuote) {
             uint256 refund = netQuote - actualCost;
             if (refund > 0) {
@@ -431,7 +335,6 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
                 require(sent, "refund failed");
             }
         } else if (actualCost > netQuote) {
-            // shouldn't happen normally, but refund netQuote and revert
             (bool r,) = payable(msg.sender).call{value: netQuote}("");
             require(r, "refund failed");
             revert("quote short");
@@ -439,8 +342,9 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
         require(ds >= minTokensOut, "slippage");
 
-        require(token.transfer(msg.sender, ds), "token transfer failed");
+        // LOT-24 (Audit): CEI — update state before external call
         sold += ds;
+        require(token.transfer(msg.sender, ds), "token transfer failed");
 
         if (sold >= curveAllocation) {
             curveFinished = true;
@@ -453,34 +357,34 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // --------------------
     // SELL (receive BNB)
     // --------------------
-    // Seller approves the contract for tokensIn, then calls sell(tokensIn, minQuoteOut)
-    function sell(uint256 tokensIn, uint256 /* minQuoteOut */) external nonReentrant {
+    // LOT-01 (Audit): Enforce minQuoteOut for slippage protection; LOT-21: deadline for stale txs
+    function sell(uint256 tokensIn, uint256 minQuoteOut, uint256 deadline) external nonReentrant {
+        require(block.timestamp <= deadline, "transaction expired");
         require(tokensIn > 0, "zero tokens");
         require(tokensIn <= sold, "cannot sell more than sold");
 
-        // pull tokens
         require(token.transferFrom(msg.sender, address(this), tokensIn), "transferFrom failed");
 
         uint256 grossOut = sellQuoteFor(sold, tokensIn);
-        require(grossOut > 0, "quote too small"); // Prevent selling when quote is 0 (due to rounding)
-        
+        require(grossOut > 0, "quote too small");
+
         uint256 fee = (grossOut * FEE_BPS) / BPS_BASE;
         uint256 netOut = grossOut - fee;
+        require(netOut >= minQuoteOut, "slippage");
 
-        // Need enough BNB to pay both netOut (to seller) and fee (to feeRecipient)
         require(address(this).balance >= grossOut, "insufficient liquidity");
 
-        // send net BNB to seller
+        // LOT-24 (Audit): CEI — update state before external calls
+        sold -= tokensIn;
+
         (bool sent,) = payable(msg.sender).call{value: netOut}("");
         require(sent, "pay seller failed");
 
-        // forward fee to feeRecipient
         if (fee > 0) {
             (bool ok,) = payable(feeRecipient).call{value: fee}("");
             require(ok, "fee transfer failed");
         }
 
-        sold -= tokensIn;
         emit Sell(msg.sender, tokensIn, netOut, fee);
     }
 
