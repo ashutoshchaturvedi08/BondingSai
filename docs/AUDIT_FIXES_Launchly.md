@@ -151,3 +151,43 @@ This document maps each audit finding (LOT-01 through LOT-27) to the changes mad
 | **Total**      | **25**| **All addressed**   |
 
 All 25 findings from the Launchly Intermediary Audit Report (Lotique Labs) have been addressed with the changes above and accompanying comments in the code (tagged with “LOT-XX (Audit)” where applicable) for easy cross-reference during re-testing.
+
+---
+
+# Audit Round 2 – Remediation Summary
+
+## CRITICAL
+
+### 7.28 – transferOwnership() Called Before setExcludedFromLimits() Causes Factory Revert
+- **Fix:** Call `setExcludedFromLimits(curveAddress, true)` **before** `transferOwnership(msg.sender)` in both factories. The factory must perform all owner-only operations while it still owns the token.
+- **Files:** `contracts/TokenFactory.sol`, `contracts/TokenFactoryWithCurve.sol` – order of calls corrected; added `require(token.isExcludedFromLimits(...), "curve exclusion failed")` as defense-in-depth (7.29).
+
+## HIGH
+
+### 7.29 – Bonding Curve Anti-Sniper Exclusion Never Applied Due to Ownership Handoff Order
+- **Fix:** Resolved by 7.28 (reorder). Additionally, `require(token.isExcludedFromLimits(curveAddress), "curve exclusion failed")` ensures the exclusion was applied before ownership is transferred.
+- **Files:** Same as 7.28.
+
+## LOW
+
+### 7.30 – sell() Performs transferFrom External Call Before Updating sold State Variable
+- **Fix:** Strict CEI: compute `grossOut` and all checks first, then `sold -= tokensIn`, then `token.safeTransferFrom(...)`, then BNB transfers. State is updated before any external call.
+- **Files:** `contracts/BondingCurve.sol` – `sell()`.
+
+## MEDIUM
+
+### 7.31 – depositCurveTokens() and buyWithBNB() Use Raw transfer/transferFrom Instead of SafeERC20
+- **Fix:** Replaced all raw `transfer`/`transferFrom` with `token.safeTransfer` and `token.safeTransferFrom` in `depositCurveTokens()`, `buyWithBNB()`, and `sell()`.
+- **Files:** `contracts/BondingCurve.sol`.
+
+### 7.32 – feeRecipient Zero-Value BNB Probe Is Insufficient
+- **Fix:** Constructor is `payable`. If `msg.value >= 1`: send 1 wei to `feeRecipient` and require success; refund `msg.value - 1` to `msg.sender`. If `msg.value == 0`: keep zero-value probe.
+- **Files:** `contracts/BondingCurve.sol` – constructor.
+
+### 7.33 – BondingCurveFactory.createBondingCurve() Has No Access Control
+- **Fix:** Added `authorizedCallers` mapping, `onlyAuthorized` modifier, `setAuthorizedCaller(caller, authorized) onlyOwner`, and `createBondingCurve() external onlyAuthorized`. **After deploying TokenFactory, owner must call** `bondingCurveFactory.setAuthorizedCaller(tokenFactoryAddress, true)`.
+- **Files:** `contracts/BondingCurveFactory.sol`.
+
+### 7.34 – Centralization and Rug-Pull Vectors via Owner-Controlled Functions
+- **Fix:** (1) Documented centralization in comments on `markCurveFinished()`, `withdrawToken()`, and `rescueBNB()` in BondingCurve. (2) MemeToken: added `antiSniperLocked` and `lockAntiSniperSettings()`; when locked, `updateAntiSniperSettings` only allows relaxing limits (cannot reduce maxWallet/maxTransaction, cannot increase cooldown).
+- **Files:** `contracts/BondingCurve.sol`, `contracts/MemeToken.sol`.

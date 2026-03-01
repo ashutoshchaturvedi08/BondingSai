@@ -16,6 +16,8 @@ contract MemeToken is Ownable, ReentrancyGuard {
     uint256 public maxWallet;
     uint256 public maxTransaction;
     uint256 public cooldownPeriod;
+    /// LOT-34 (Audit Round 2): Once locked, owner can only relax limits (not tighten) to prevent weaponizing anti-sniper
+    bool public antiSniperLocked;
     
     // Rich metadata
     string public description;
@@ -138,7 +140,12 @@ contract MemeToken is Ownable, ReentrancyGuard {
         return true;
     }
     
-    // Owner functions for configuration
+    /// LOT-34 (Audit Round 2): Lock anti-sniper so only relaxing is allowed (prevents owner from blocking sells via maxTx=1 etc.)
+    function lockAntiSniperSettings() external onlyOwner {
+        antiSniperLocked = true;
+    }
+
+    // LOT-34 (Audit Round 2): When antiSniperLocked, owner can only relax limits (increase maxWallet/maxTransaction, decrease cooldown).
     function updateAntiSniperSettings(
         bool _antiSniperEnabled,
         uint256 _maxWallet,
@@ -149,7 +156,15 @@ contract MemeToken is Ownable, ReentrancyGuard {
         require(_maxTransaction > 0, "Max transaction must be greater than 0");
         require(_maxTransaction <= _maxWallet, "Max transaction must be <= max wallet");
         require(_cooldownPeriod > 0, "Cooldown period must be greater than 0");
-        
+
+        if (antiSniperLocked) {
+            uint256 maxWalletUnscaled = maxWallet / (10 ** decimals);
+            uint256 maxTxUnscaled = maxTransaction / (10 ** decimals);
+            require(_maxWallet >= maxWalletUnscaled, "cannot reduce maxWallet when locked");
+            require(_maxTransaction >= maxTxUnscaled, "cannot reduce maxTransaction when locked");
+            require(_cooldownPeriod <= cooldownPeriod, "cannot increase cooldown when locked");
+        }
+
         antiSniperEnabled = _antiSniperEnabled;
         maxWallet = _maxWallet * (10 ** decimals);
         maxTransaction = _maxTransaction * (10 ** decimals);

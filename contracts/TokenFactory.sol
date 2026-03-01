@@ -158,8 +158,12 @@ contract TokenFactory is Ownable {
         IERC20(tokenAddress).safeTransfer(bondingCurveAddress, curveAllocation);
         IERC20(tokenAddress).safeTransfer(msg.sender, creatorAllocation);
 
-        token.transferOwnership(msg.sender);
+        // LOT-28 (Audit Round 2): Call setExcludedFromLimits BEFORE transferOwnership — factory must perform
+        // owner-only operations while it still owns the token; otherwise setExcludedFromLimits reverts (onlyOwner).
         token.setExcludedFromLimits(bondingCurveAddress, true);
+        // LOT-29 (Audit Round 2): Defense-in-depth — verify exclusion was applied before handing off ownership
+        require(token.isExcludedFromLimits(bondingCurveAddress), "curve exclusion failed");
+        token.transferOwnership(msg.sender);
 
         emit TokenWithBondingCurveCreated(
             tokenAddress,

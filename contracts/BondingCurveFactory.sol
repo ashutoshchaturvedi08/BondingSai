@@ -14,6 +14,14 @@ import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.so
 contract BondingCurveFactory is Ownable {
     address public immutable feeRecipient;
     AggregatorV3Interface public immutable bnbPriceFeed;
+
+    // LOT-33 (Audit Round 2): Restrict createBondingCurve to authorized callers (e.g. TokenFactory) to prevent spam/fraud
+    mapping(address => bool) public authorizedCallers;
+
+    modifier onlyAuthorized() {
+        require(authorizedCallers[msg.sender] || msg.sender == owner(), "unauthorized");
+        _;
+    }
     
     uint256 public constant START_MARKET_CAP_USD = 5000; // $5,000 (initial market cap at start)
     uint256 public constant END_MARKET_CAP_USD = 76963; // ~$76,963 (target market cap at end, matching four.meme)
@@ -39,6 +47,7 @@ contract BondingCurveFactory is Ownable {
         uint256 curveAllocation,
         uint256 bnbPriceUSD
     );
+    event AuthorizedCallerSet(address indexed caller, bool authorized);
 
     /**
      * @param _feeRecipient Address to receive 1% fees from buy/sell
@@ -184,8 +193,15 @@ contract BondingCurveFactory is Ownable {
         }
     }
 
+    /// @notice LOT-33 (Audit Round 2): Only owner or authorized callers (e.g. TokenFactory) can deploy curves.
+    function setAuthorizedCaller(address caller, bool authorized) external onlyOwner {
+        authorizedCallers[caller] = authorized;
+        emit AuthorizedCallerSet(caller, authorized);
+    }
+
     /**
      * @notice Create a bonding curve for a token
+     * LOT-33 (Audit Round 2): onlyAuthorized — register TokenFactory via setAuthorizedCaller(factory, true) after deploy.
      * @param _token Token address
      * @param _tokenDecimals Token decimals (usually 18)
      * @param _owner Owner of the bonding curve
@@ -195,7 +211,7 @@ contract BondingCurveFactory is Ownable {
         address _token,
         uint8 _tokenDecimals,
         address _owner
-    ) external returns (address bondingCurve) {
+    ) external onlyAuthorized returns (address bondingCurve) {
         require(_token != address(0), "token 0");
         require(_owner != address(0), "owner 0");
         // LOT-19 (Audit): Bonding curve math assumes 18-decimal tokens

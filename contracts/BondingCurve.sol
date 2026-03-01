@@ -42,6 +42,8 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     event CurveFinished(uint256 sold);
     // LOT-13 (Audit): Removed unused FeeRecipientChanged event - feeRecipient is immutable and never changed
 
+    /// @dev LOT-32 (Audit Round 2): Payable constructor. If msg.value >= 1 wei, validates feeRecipient with a 1-wei
+    /// transfer (zero-value probe is insufficient — some contracts accept 0 but revert on non-zero). Refunds remainder.
     constructor(
         address _token,
         uint256 _P0_wad,
@@ -49,12 +51,20 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         uint256 _curveAllocation,
         address _feeRecipient,
         address _owner
-    ) {
+    ) payable {
         require(_token != address(0), "token 0");
         require(_feeRecipient != address(0), "feeRecipient 0");
-        // LOT-20 (Audit): Verify feeRecipient can receive BNB to prevent permanent DoS of buy/sell
-        (bool testSend,) = payable(_feeRecipient).call{value: 0}("");
-        require(testSend, "feeRecipient cannot receive BNB");
+        if (msg.value >= 1) {
+            (bool ok,) = payable(_feeRecipient).call{value: 1}("");
+            require(ok, "feeRecipient cannot receive BNB");
+            if (msg.value > 1) {
+                (bool refund,) = payable(msg.sender).call{value: msg.value - 1}("");
+                require(refund, "refund failed");
+            }
+        } else {
+            (bool testSend,) = payable(_feeRecipient).call{value: 0}("");
+            require(testSend, "feeRecipient cannot receive BNB");
+        }
         token = IERC20(_token);
         P0 = _P0_wad;
         m = _m_wad;
@@ -268,15 +278,16 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // --- Admin / deposits ---
 
     /// owner must pre-fund the curve with tokens
+    /// LOT-31 (Audit Round 2): Use SafeERC20 for compatibility with non-standard ERC-20 (e.g. USDT that doesn't return bool)
     function depositCurveTokens(uint256 amount) external nonReentrant onlyOwner {
         require(amount > 0, "amount>0");
-        require(token.transferFrom(msg.sender, address(this), amount), "transfer failed");
+        token.safeTransferFrom(msg.sender, address(this), amount);
         emit DepositedTokens(msg.sender, amount);
     }
 
     // Fee recipient is immutable, cannot be changed
 
-    // LOT-06 (Audit): Withdraw only excess tokens — cannot withdraw active curve allocation
+    // LOT-06 (Audit): Withdraw only excess tokens. LOT-34: Owner can withdraw above active allocation; trust assumption.
     function withdrawToken(address to, uint256 amount) external onlyOwner {
         require(to != address(0), "zero");
         uint256 activeBalance = curveAllocation - sold;
@@ -290,7 +301,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         require(tokenAddr != address(token), "cannot rescue curve token");
         IERC20(tokenAddr).safeTransfer(to, amount);
     }
-    // LOT-06 (Audit): Rescue BNB only if curve remains solvent for current sold amount
+    // LOT-06 (Audit): Rescue BNB only if curve remains solvent. LOT-34: Combined with markCurveFinished, owner can extract within solvency; trust assumption.
     function rescueBNB(address payable to, uint256 amount) external onlyOwner {
         require(to != payable(address(0)), "zero");
         uint256 requiredBNB = sellQuoteFor(sold, sold);
@@ -299,7 +310,8 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         require(sent, "BNB send failed");
     }
 
-    // Optionally mark finished
+    // LOT-34 (Audit Round 2): Centralization — owner can unilaterally halt buys. Documented admin trust assumption.
+    // For stronger protection consider TimelockController (24–48h delay) or renouncing ownership after launch.
     function markCurveFinished() external onlyOwner {
         curveFinished = true;
         emit CurveFinished(sold);
@@ -344,7 +356,8 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
         // LOT-24 (Audit): CEI — update state before external call
         sold += ds;
-        require(token.transfer(msg.sender, ds), "token transfer failed");
+        // LOT-31 (Audit Round 2): Use SafeERC20 for compatibility with non-standard ERC-20
+        token.safeTransfer(msg.sender, ds);
 
         if (sold >= curveAllocation) {
             curveFinished = true;
@@ -358,12 +371,12 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // SELL (receive BNB)
     // --------------------
     // LOT-01 (Audit): Enforce minQuoteOut for slippage protection; LOT-21: deadline for stale txs
+    // LOT-30 (Audit Round 2): Strict CEI — update sold BEFORE any external call (including transferFrom).
+    // LOT-31 (Audit Round 2): Use safeTransferFrom for non-standard ERC-20 compatibility.
     function sell(uint256 tokensIn, uint256 minQuoteOut, uint256 deadline) external nonReentrant {
         require(block.timestamp <= deadline, "transaction expired");
         require(tokensIn > 0, "zero tokens");
         require(tokensIn <= sold, "cannot sell more than sold");
-
-        require(token.transferFrom(msg.sender, address(this), tokensIn), "transferFrom failed");
 
         uint256 grossOut = sellQuoteFor(sold, tokensIn);
         require(grossOut > 0, "quote too small");
@@ -374,8 +387,10 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
         require(address(this).balance >= grossOut, "insufficient liquidity");
 
-        // LOT-24 (Audit): CEI — update state before external calls
+        // CEI: update ALL state before ANY external calls (LOT-30)
         sold -= tokensIn;
+
+        token.safeTransferFrom(msg.sender, address(this), tokensIn);
 
         (bool sent,) = payable(msg.sender).call{value: netOut}("");
         require(sent, "pay seller failed");
