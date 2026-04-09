@@ -15,6 +15,8 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 // LOT-06 (Audit): SafeERC20 used for rescue/withdraw to prevent rug-pull and handle non-standard tokens
 
@@ -36,10 +38,19 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     uint256 public immutable curveAllocation; // total tokens allocated to this curve (raw units)
     bool public curveFinished;
 
+    // AUDIT FIX (BUG-2,3,10): Track cumulative sell fees extracted from contract to adjust solvency checks
+    uint256 public totalSellFeesExtracted;
+
+    // AUDIT FIX (BUG-8): Time-locked sweep for burned/lost tokens that lock BNB forever
+    uint256 public curveFinishedAt;
+    uint256 public constant SWEEP_DELAY = 180 days;
+
     event DepositedTokens(address indexed from, uint256 amount);
     event Buy(address indexed buyer, uint256 bnbIn, uint256 tokensOut, uint256 fee);
     event Sell(address indexed seller, uint256 tokensIn, uint256 bnbOut, uint256 fee);
     event CurveFinished(uint256 sold);
+    event LiquidityMigrated(address indexed to, uint256 amount);
+    event BNBSwept(address indexed to, uint256 amount);
     // LOT-13 (Audit): Removed unused FeeRecipientChanged event - feeRecipient is immutable and never changed
 
     /// @dev LOT-32 (Audit Round 2): Payable constructor. If msg.value >= 1 wei, validates feeRecipient with a 1-wei
@@ -54,6 +65,15 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     ) payable {
         require(_token != address(0), "token 0");
         require(_feeRecipient != address(0), "feeRecipient 0");
+
+        // AUDIT FIX (BUG-17): Reject degenerate curve parameters that produce broken/free curves
+        require(_P0_wad > 0, "P0 must be > 0");
+        require(_m_wad > 0, "m must be > 0");
+        require(_curveAllocation > 0, "curveAllocation must be > 0");
+
+        // AUDIT FIX (BUG-22): Bonding curve math requires 18-decimal tokens; reject non-18
+        require(IERC20Metadata(_token).decimals() == 18, "requires 18 decimals");
+
         if (msg.value >= 1) {
             (bool ok,) = payable(_feeRecipient).call{value: 1}("");
             require(ok, "feeRecipient cannot receive BNB");
@@ -99,30 +119,15 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         return P0 + (m * s) / curveAllocation;
     }
 
-    /// @dev LOT-18 (Audit): Quadratic term helper - correct formula without extra /WAD that nullified price progression.
-    /// term2 = m * ds^2 / (2 * curveAllocation * WAD). With dsOverWad = ds/WAD, curveAllocationOverWad = curveAllocation/WAD:
-    /// term2 = m * dsOverWad^2 / (2 * curveAllocationOverWad) — NO extra /WAD.
+    /// @dev LOT-18 (Audit): Quadratic term helper.
+    /// term2 = m * ds^2 / (2 * curveAllocation * WAD)
+    /// AUDIT FIX (BUG-15,21): Replaced multi-branch integer arithmetic with Math.mulDiv for full
+    /// 512-bit intermediate precision. Eliminates rounding divergence that caused solvency deficit,
+    /// non-additive quotes, and path-dependent pricing across all token magnitudes including sub-WAD.
     function _quadraticTerm(uint256 ds) internal view returns (uint256) {
         if (ds == 0 || curveAllocation == 0) return 0;
-        uint256 dsOverWad = ds / WAD;
-        uint256 curveAllocationOverWad = curveAllocation / WAD;
-        if (dsOverWad == 0) {
-            // LOT-08 (Audit): Sub-WAD branch - consistent with buy path: divide by 2 only (no extra /WAD)
-            uint256 mOverWad = m / WAD;
-            uint256 dsSquaredOverCurveAlloc = (ds * ds) / curveAllocation;
-            return (mOverWad * dsSquaredOverCurveAlloc) / 2;
-        }
-        if (curveAllocationOverWad == 0) return 0;
-        if (m <= type(uint256).max / dsOverWad) {
-            uint256 temp = m * dsOverWad;
-            if (temp <= type(uint256).max / dsOverWad) {
-                uint256 temp2 = temp * dsOverWad;
-                return (temp2 / curveAllocationOverWad) / 2; // NO extra / WAD (LOT-18)
-            }
-        }
-        uint256 mOverWad = m / WAD;
-        uint256 numerator = mOverWad * dsOverWad * dsOverWad;
-        return (numerator * WAD) / (2 * curveAllocationOverWad);
+        uint256 dsSquaredOverWad = Math.mulDiv(ds, ds, WAD);
+        return Math.mulDiv(m, dsSquaredOverWad, 2 * curveAllocation);
     }
 
     // Cost (in wei) to buy ds tokens from state s:
@@ -136,19 +141,26 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         return term1 + _quadraticTerm(ds);
     }
 
-    // Quote returned when selling ds from state s: term1 - term2 (same term2 as buy via _quadraticTerm)
+    /// @notice Quote returned when selling ds tokens from state s.
+    /// AUDIT FIX (BUG-1,4,5,6 — Root Cause): Compute base price at (s - ds) — the bottom of the
+    /// sell range — instead of s (the top). This makes sellQuoteFor(s, ds) == buyQuoteFor(s - ds, ds),
+    /// eliminating the rounding asymmetry that caused insolvency after every buy, sell-quote exceeding
+    /// buy-quote, and the impossible buy-sell roundtrip.
     function sellQuoteFor(uint256 s, uint256 ds) public view returns (uint256) {
         require(ds <= s, "ds > s");
         if (ds == 0) return 0;
         if (curveAllocation == 0) return 0;
-        uint256 b = P0 + (m * s) / curveAllocation;
+        uint256 b = P0 + (m * (s - ds)) / curveAllocation;
         uint256 term1 = (b * ds) / WAD;
-        uint256 term2 = _quadraticTerm(ds);
-        if (term1 >= term2) return term1 - term2;
-        return 0;
+        return term1 + _quadraticTerm(ds);
     }
 
-    // Solve for ds given netQuote using binary search
+    /// @notice Solve for ds given netQuote using binary search.
+    /// @dev AUDIT NOTE (BUG-11): Splitting a large buy into many small buys may yield ~0.00005% more
+    /// tokens due to integer rounding in the binary search. This is a known limitation; the gas cost
+    /// of splitting exceeds the rounding profit. Similarly (BUG-12), splitting sells into smaller
+    /// chunks compounds rounding loss. Both are inherent to discrete-step binary search over an
+    /// integer integral. Math.mulDiv in _quadraticTerm minimizes but cannot eliminate this.
     function tokensForQuote(uint256 s, uint256 netQuote) public view returns (uint256) {
         if (netQuote == 0) return 0;
         uint256 remaining = curveAllocation - s;
@@ -302,9 +314,15 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         IERC20(tokenAddr).safeTransfer(to, amount);
     }
     // LOT-06 (Audit): Rescue BNB only if curve remains solvent. LOT-34: Combined with markCurveFinished, owner can extract within solvency; trust assumption.
+    // AUDIT FIX (BUG-14): Guard against underflow when amount > balance (was Panic(0x11), now readable error).
+    // AUDIT FIX (BUG-2,3,10): Subtract totalSellFeesExtracted from required reserve — fees already left the contract.
     function rescueBNB(address payable to, uint256 amount) external onlyOwner {
         require(to != payable(address(0)), "zero");
-        uint256 requiredBNB = sellQuoteFor(sold, sold);
+        require(amount <= address(this).balance, "insufficient balance");
+        uint256 grossRequired = sellQuoteFor(sold, sold);
+        uint256 requiredBNB = grossRequired > totalSellFeesExtracted
+            ? grossRequired - totalSellFeesExtracted
+            : 0;
         require(address(this).balance - amount >= requiredBNB, "would make curve insolvent");
         (bool sent,) = to.call{value: amount}("");
         require(sent, "BNB send failed");
@@ -312,8 +330,10 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
     // LOT-34 (Audit Round 2): Centralization — owner can unilaterally halt buys. Documented admin trust assumption.
     // For stronger protection consider TimelockController (24–48h delay) or renouncing ownership after launch.
+    // AUDIT FIX (BUG-8): Record curveFinishedAt for time-locked sweep of permanently stuck BNB.
     function markCurveFinished() external onlyOwner {
         curveFinished = true;
+        curveFinishedAt = block.timestamp;
         emit CurveFinished(sold);
     }
 
@@ -361,6 +381,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
         if (sold >= curveAllocation) {
             curveFinished = true;
+            curveFinishedAt = block.timestamp; // AUDIT FIX (BUG-8)
             emit CurveFinished(sold);
         }
 
@@ -373,8 +394,10 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // LOT-01 (Audit): Enforce minQuoteOut for slippage protection; LOT-21: deadline for stale txs
     // LOT-30 (Audit Round 2): Strict CEI — update sold BEFORE any external call (including transferFrom).
     // LOT-31 (Audit Round 2): Use safeTransferFrom for non-standard ERC-20 compatibility.
+    // AUDIT FIX (BUG-13,16): Block sells after curveFinished to protect BNB reserved for DEX migration.
     function sell(uint256 tokensIn, uint256 minQuoteOut, uint256 deadline) external nonReentrant {
         require(block.timestamp <= deadline, "transaction expired");
+        require(!curveFinished, "curve finished"); // AUDIT FIX (BUG-13,16)
         require(tokensIn > 0, "zero tokens");
         require(tokensIn <= sold, "cannot sell more than sold");
 
@@ -389,6 +412,9 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
         // CEI: update ALL state before ANY external calls (LOT-30)
         sold -= tokensIn;
+        // AUDIT FIX (BUG-2,3,10): Track cumulative sell fees so rescueBNB solvency check
+        // accounts for BNB that already left the contract as fees.
+        totalSellFeesExtracted += fee;
 
         token.safeTransferFrom(msg.sender, address(this), tokensIn);
 
@@ -401,6 +427,33 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         }
 
         emit Sell(msg.sender, tokensIn, netOut, fee);
+    }
+
+    // --- DEX Migration & Sweep ---
+
+    /// @notice AUDIT FIX (BUG-9): Migrate BNB to DEX after curve finishes. Since sells are blocked
+    /// after curveFinished (BUG-13 fix), no reserve is needed and all BNB can go to DEX LP.
+    function migrateLiquidity(address payable to) external onlyOwner {
+        require(curveFinished, "not finished");
+        require(to != payable(address(0)), "zero");
+        uint256 balance = address(this).balance;
+        require(balance > 0, "no BNB");
+        (bool ok,) = to.call{value: balance}("");
+        require(ok, "transfer failed");
+        emit LiquidityMigrated(to, balance);
+    }
+
+    /// @notice AUDIT FIX (BUG-8): Time-locked sweep for BNB permanently stuck due to burned/lost tokens.
+    /// Only available 180 days after curveFinished — gives token holders ample time to sell on DEX.
+    function sweepRemainingBNB(address payable to) external onlyOwner {
+        require(curveFinished, "not finished");
+        require(curveFinishedAt > 0, "finishedAt not set");
+        require(block.timestamp >= curveFinishedAt + SWEEP_DELAY, "too early");
+        require(to != payable(address(0)), "zero");
+        uint256 balance = address(this).balance;
+        (bool ok,) = to.call{value: balance}("");
+        require(ok, "transfer failed");
+        emit BNBSwept(to, balance);
     }
 
     // receive fallback (pull in BNB if someone sends accidentally)

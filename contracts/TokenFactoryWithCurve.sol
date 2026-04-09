@@ -13,9 +13,12 @@ contract TokenFactoryWithCurve is Ownable {
     address public immutable feeRecipient;
 
     // LOT-12 (Audit): Bounds for P0 and m to prevent free/flat curves and overflow
-    uint256 public constant MIN_P0 = 1;
+    // AUDIT FIX (BUG-19): Increased MIN_P0 and MIN_M from 1 to 1e6. With MIN=1 (1 wei in WAD),
+    // P0 = 0.000000000000000001 BNB/token — effectively free. 1e6 ensures a minimum meaningful price
+    // of ~0.000000000001 BNB/token, preventing sub-dust economics that offer no economic protection.
+    uint256 public constant MIN_P0 = 1e6;
     uint256 public constant MAX_P0 = 1e18;
-    uint256 public constant MIN_M = 1;
+    uint256 public constant MIN_M = 1e6;
     uint256 public constant MAX_M = 100e18;
 
     event TokenCreated(address tokenAddress, address creator, string name, string symbol);

@@ -97,22 +97,28 @@ contract MemeToken is Ownable, ReentrancyGuard {
     }
 
     // LOT-16 (Audit): Removed nonReentrant — no external calls in transfer; saves gas and allows use inside other nonReentrant flows
+    // AUDIT FIX (BUG-18): Check sender and recipient limits independently. Previously, when the sender
+    // was excluded (e.g., the bonding curve), ALL limits were bypassed including maxWallet on the recipient.
+    // Now: sender exclusion only skips sender-side checks (maxTransaction, cooldown). Recipient maxWallet
+    // is always enforced unless the recipient is also excluded.
     function transferFrom(address from, address to, uint256 value) external returns (bool) {
         require(balanceOf[from] >= value, "Insufficient balance");
         require(to != address(0), "Transfer to zero address");
         
-        // Check allowance
         if (from != msg.sender) {
             require(allowance[from][msg.sender] >= value, "Insufficient allowance");
             allowance[from][msg.sender] -= value;
         }
         
-        // LOT-26 (Audit): Only update lastTransferTime when actively enforcing anti-sniper
-        if (antiSniperEnabled && !excludedFromLimits[from]) {
-            require(value <= maxTransaction, "Transfer > maxTransaction");
-            require(balanceOf[to] + value <= maxWallet, "Recipient > maxWallet");
-            require(block.timestamp - lastTransferTime[from] >= cooldownPeriod, "Cooldown active");
-            lastTransferTime[from] = block.timestamp;
+        if (antiSniperEnabled) {
+            if (!excludedFromLimits[from]) {
+                require(value <= maxTransaction, "Transfer > maxTransaction");
+                require(block.timestamp - lastTransferTime[from] >= cooldownPeriod, "Cooldown active");
+                lastTransferTime[from] = block.timestamp;
+            }
+            if (!excludedFromLimits[to]) {
+                require(balanceOf[to] + value <= maxWallet, "Recipient > maxWallet");
+            }
         }
 
         balanceOf[from] -= value;
@@ -122,15 +128,20 @@ contract MemeToken is Ownable, ReentrancyGuard {
         return true;
     }
     
+    // AUDIT FIX (BUG-18): Same independent sender/recipient limit checks as transferFrom.
     function transfer(address to, uint256 value) external returns (bool) {
         require(balanceOf[msg.sender] >= value, "Insufficient balance");
         require(to != address(0), "Transfer to zero address");
 
-        if (antiSniperEnabled && !excludedFromLimits[msg.sender]) {
-            require(value <= maxTransaction, "Transfer > maxTransaction");
-            require(balanceOf[to] + value <= maxWallet, "Recipient > maxWallet");
-            require(block.timestamp - lastTransferTime[msg.sender] >= cooldownPeriod, "Cooldown active");
-            lastTransferTime[msg.sender] = block.timestamp;
+        if (antiSniperEnabled) {
+            if (!excludedFromLimits[msg.sender]) {
+                require(value <= maxTransaction, "Transfer > maxTransaction");
+                require(block.timestamp - lastTransferTime[msg.sender] >= cooldownPeriod, "Cooldown active");
+                lastTransferTime[msg.sender] = block.timestamp;
+            }
+            if (!excludedFromLimits[to]) {
+                require(balanceOf[to] + value <= maxWallet, "Recipient > maxWallet");
+            }
         }
 
         balanceOf[msg.sender] -= value;

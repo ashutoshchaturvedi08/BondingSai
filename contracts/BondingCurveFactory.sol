@@ -65,7 +65,10 @@ contract BondingCurveFactory is Ownable {
 
     /**
      * @notice Get latest BNB price from Chainlink Price Feed
-     * LOT-04 (Audit): Staleness validation via updatedAt; roundId check; no answeredInRound (deprecated)
+     * LOT-04 (Audit): Staleness validation via updatedAt; roundId check.
+     * AUDIT FIX (BUG-23): Validate answeredInRound >= roundId to reject stale carried-over answers.
+     * Chainlink V3 still returns answeredInRound; when answeredInRound < roundId the price was
+     * carried forward from an earlier round without a fresh update.
      * @return price BNB price in USD with 18 decimals (WAD)
      */
     function getLatestBNBPrice() public view returns (uint256 price) {
@@ -74,20 +77,27 @@ contract BondingCurveFactory is Ownable {
             int256 rawPrice,
             /* uint startedAt */,
             uint256 updatedAt,
-            /* uint80 answeredInRound */
+            uint80 answeredInRound
         ) = bnbPriceFeed.latestRoundData();
 
         require(rawPrice > 0, "Invalid price");
         require(roundId != 0, "Invalid round");
         require(updatedAt != 0 && updatedAt <= block.timestamp, "Invalid timestamp");
         require(block.timestamp - updatedAt <= STALENESS_THRESHOLD, "Stale price");
+        // AUDIT FIX (BUG-23): Reject stale carried-over oracle answers
+        require(answeredInRound >= roundId, "Stale answer");
 
         price = uint256(rawPrice) * (10 ** 10);
     }
 
     /**
-     * @notice Calculate bonding curve parameters to match four.meme pricing exactly
+     * @notice Calculate bonding curve parameters to match four.meme pricing exactly.
      * LOT-09 (Audit): bnbPriceUSD is fetched and returned for off-chain use; P0/m are BNB-denominated (fixed targets), not dynamically derived from USD here.
+     * AUDIT NOTE (BUG-24): P0 and m are BNB-denominated constants — they do NOT vary with BNB/USD price.
+     * The Chainlink feed is used only to return bnbPriceUSD as informational metadata. START_MARKET_CAP_USD
+     * and END_MARKET_CAP_USD are reference documentation only and are not used in calculations.
+     * If the feed is stale, curve deployment will fail even though the price has no effect on P0/m.
+     * To decouple deployment from feed availability, consider passing bnbPriceUSD as an off-chain parameter.
      * @dev Uses multiple target points to calculate m accurately:
      *      - 0.00099 BNB → 170,734 tokens
      *      - 0.0099 BNB → 1,704,902 tokens
