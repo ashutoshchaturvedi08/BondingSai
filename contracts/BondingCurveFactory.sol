@@ -94,14 +94,26 @@ contract BondingCurveFactory is Ownable {
         price = uint256(rawPrice) * (10 ** 10);
     }
 
+    /// @notice AUDIT FIX (MEDIUM-6): Non-reverting BNB price fetch. Returns 0 if feed is stale/unavailable.
+    function tryGetLatestBNBPrice() public view returns (uint256 price) {
+        try bnbPriceFeed.latestRoundData() returns (
+            uint80 roundId, int256 rawPrice, uint256, uint256 updatedAt, uint80 answeredInRound
+        ) {
+            if (rawPrice <= 0 || roundId == 0 || updatedAt == 0 || updatedAt > block.timestamp) return 0;
+            if (block.timestamp - updatedAt > STALENESS_THRESHOLD) return 0;
+            if (answeredInRound < roundId) return 0;
+            price = uint256(rawPrice) * (10 ** 10);
+        } catch {
+            return 0;
+        }
+    }
+
     /**
      * @notice Calculate bonding curve parameters to match four.meme pricing exactly.
      * LOT-09 (Audit): bnbPriceUSD is fetched and returned for off-chain use; P0/m are BNB-denominated (fixed targets), not dynamically derived from USD here.
      * AUDIT NOTE (BUG-24): P0 and m are BNB-denominated constants — they do NOT vary with BNB/USD price.
      * The Chainlink feed is used only to return bnbPriceUSD as informational metadata. START_MARKET_CAP_USD
      * and END_MARKET_CAP_USD are reference documentation only and are not used in calculations.
-     * If the feed is stale, curve deployment will fail even though the price has no effect on P0/m.
-     * To decouple deployment from feed availability, consider passing bnbPriceUSD as an off-chain parameter.
      * @dev Uses multiple target points to calculate m accurately:
      *      - 0.00099 BNB → 170,734 tokens
      *      - 0.0099 BNB → 1,704,902 tokens
@@ -119,8 +131,10 @@ contract BondingCurveFactory is Ownable {
         uint256 m_wad,
         uint256 bnbPriceUSD
     ) {
-        // Fetch real-time BNB price from Chainlink (8 decimals -> 18 decimals)
-        bnbPriceUSD = getLatestBNBPrice(); // Now in WAD (18 decimals)
+        // AUDIT FIX (MEDIUM-6): Use non-reverting price fetch. P0 and m are fixed BNB-denominated
+        // constants that don't depend on the price. The feed is informational only — a stale feed
+        // should not block curve creation.
+        bnbPriceUSD = tryGetLatestBNBPrice();
         
         // Set P0 directly to target initial price: 5.798e-9 BNB per token (matching four.meme)
         // P0 = 5798 / 1e12 * 1e18 = 5798 * 1e6 = 5798000000 (in WAD)

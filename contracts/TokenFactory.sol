@@ -163,6 +163,8 @@ contract TokenFactory is Ownable {
         token.setExcludedFromLimits(bondingCurveAddress, true);
         // LOT-29 (Audit Round 2): Defense-in-depth — verify exclusion was applied before handing off ownership
         require(token.isExcludedFromLimits(bondingCurveAddress), "curve exclusion failed");
+        // AUDIT FIX (HIGH-4): Auto-lock anti-sniper settings at deployment to prevent weaponization.
+        token.lockAntiSniperSettings();
         token.transferOwnership(msg.sender);
 
         emit TokenWithBondingCurveCreated(

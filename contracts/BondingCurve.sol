@@ -45,6 +45,17 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     uint256 public curveFinishedAt;
     uint256 public constant SWEEP_DELAY = 180 days;
 
+    // AUDIT FIX (CRITICAL-1): Track tokens each address bought from the curve. Only tokens purchased
+    // through buyWithBNB can be sold back. This prevents the creator (who receives 20% free tokens)
+    // from selling their free allocation through the curve to drain all buyer BNB.
+    mapping(address => uint256) public boughtFromCurve;
+
+    // AUDIT FIX (HIGH-5): Timelock between markCurveFinished and migrateLiquidity to prevent instant rug.
+    // Owner must wait MIGRATION_DELAY after finishing before draining BNB.
+    uint256 public constant MIGRATION_DELAY = 24 hours;
+    // AUDIT FIX (HIGH-5): Minimum percentage of curveAllocation that must be sold before owner can finish.
+    uint256 public constant MIN_SOLD_PERCENT_TO_FINISH = 50;
+
     event DepositedTokens(address indexed from, uint256 amount);
     event Buy(address indexed buyer, uint256 bnbIn, uint256 tokensOut, uint256 fee);
     event Sell(address indexed seller, uint256 tokensIn, uint256 bnbOut, uint256 fee);
@@ -316,7 +327,8 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // LOT-06 (Audit): Rescue BNB only if curve remains solvent. LOT-34: Combined with markCurveFinished, owner can extract within solvency; trust assumption.
     // AUDIT FIX (BUG-14): Guard against underflow when amount > balance (was Panic(0x11), now readable error).
     // AUDIT FIX (BUG-2,3,10): Subtract totalSellFeesExtracted from required reserve — fees already left the contract.
-    function rescueBNB(address payable to, uint256 amount) external onlyOwner {
+    // AUDIT FIX (CRITICAL-3): nonReentrant prevents reentrancy via .call{value} callback.
+    function rescueBNB(address payable to, uint256 amount) external onlyOwner nonReentrant {
         require(to != payable(address(0)), "zero");
         require(amount <= address(this).balance, "insufficient balance");
         uint256 grossRequired = sellQuoteFor(sold, sold);
@@ -331,7 +343,13 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // LOT-34 (Audit Round 2): Centralization — owner can unilaterally halt buys. Documented admin trust assumption.
     // For stronger protection consider TimelockController (24–48h delay) or renouncing ownership after launch.
     // AUDIT FIX (BUG-8): Record curveFinishedAt for time-locked sweep of permanently stuck BNB.
+    // AUDIT FIX (HIGH-5): Require minimum 50% of curveAllocation sold before owner can manually finish.
+    // This prevents instant rug where owner calls markCurveFinished() + migrateLiquidity() with 0 tokens sold.
     function markCurveFinished() external onlyOwner {
+        require(
+            sold >= (curveAllocation * MIN_SOLD_PERCENT_TO_FINISH) / 100,
+            "minimum sold threshold not met"
+        );
         curveFinished = true;
         curveFinishedAt = block.timestamp;
         emit CurveFinished(sold);
@@ -341,41 +359,45 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // BUY (payable) - BNB
     // --------------------
     // LOT-21 (Audit): deadline prevents stale transactions (e.g. Four.Meme-style sandwich on BSC)
+    // AUDIT FIX (CRITICAL-2): Fee is now computed on actualCost (what the user actually pays for tokens),
+    // not on msg.value. On partial fills the user was overcharged up to 3.3x. Now fee = 1% of actualCost only.
     function buyWithBNB(uint256 minTokensOut, uint256 deadline) external payable nonReentrant {
         require(block.timestamp <= deadline, "transaction expired");
         require(!curveFinished, "curve finished");
         require(msg.value > 0, "send BNB");
 
-        uint256 fee = (msg.value * FEE_BPS) / BPS_BASE;
-        if (fee > 0) {
-            (bool ok,) = payable(feeRecipient).call{value: fee}("");
-            require(ok, "fee transfer failed");
-        }
-        uint256 netQuote = msg.value - fee;
+        uint256 maxNetQuote = msg.value - ((msg.value * FEE_BPS) / BPS_BASE);
 
-        uint256 ds = tokensForQuote(sold, netQuote);
+        uint256 ds = tokensForQuote(sold, maxNetQuote);
         require(ds > 0, "insufficient BNB");
 
         uint256 remaining = curveAllocation - sold;
         if (ds > remaining) ds = remaining;
 
         uint256 actualCost = buyQuoteFor(sold, ds);
-        if (actualCost < netQuote) {
-            uint256 refund = netQuote - actualCost;
-            if (refund > 0) {
-                (bool sent,) = payable(msg.sender).call{value: refund}("");
-                require(sent, "refund failed");
-            }
-        } else if (actualCost > netQuote) {
-            (bool r,) = payable(msg.sender).call{value: netQuote}("");
-            require(r, "refund failed");
-            revert("quote short");
+        require(actualCost <= maxNetQuote, "quote short");
+
+        // AUDIT FIX (CRITICAL-2): Compute fee on actualCost, not msg.value
+        uint256 fee = (actualCost * FEE_BPS) / (BPS_BASE - FEE_BPS);
+        uint256 totalCharged = actualCost + fee;
+
+        if (totalCharged < msg.value) {
+            uint256 refund = msg.value - totalCharged;
+            (bool sent,) = payable(msg.sender).call{value: refund}("");
+            require(sent, "refund failed");
+        }
+
+        if (fee > 0) {
+            (bool ok,) = payable(feeRecipient).call{value: fee}("");
+            require(ok, "fee transfer failed");
         }
 
         require(ds >= minTokensOut, "slippage");
 
         // LOT-24 (Audit): CEI — update state before external call
         sold += ds;
+        // AUDIT FIX (CRITICAL-1): Track tokens bought per user to prevent creator rug via sell()
+        boughtFromCurve[msg.sender] += ds;
         // LOT-31 (Audit Round 2): Use SafeERC20 for compatibility with non-standard ERC-20
         token.safeTransfer(msg.sender, ds);
 
@@ -395,11 +417,14 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // LOT-30 (Audit Round 2): Strict CEI — update sold BEFORE any external call (including transferFrom).
     // LOT-31 (Audit Round 2): Use safeTransferFrom for non-standard ERC-20 compatibility.
     // AUDIT FIX (BUG-13,16): Block sells after curveFinished to protect BNB reserved for DEX migration.
+    // AUDIT FIX (CRITICAL-1): Only tokens purchased through buyWithBNB can be sold back. This prevents
+    // the creator from selling their free 20% allocation to drain all buyer BNB.
     function sell(uint256 tokensIn, uint256 minQuoteOut, uint256 deadline) external nonReentrant {
         require(block.timestamp <= deadline, "transaction expired");
         require(!curveFinished, "curve finished"); // AUDIT FIX (BUG-13,16)
         require(tokensIn > 0, "zero tokens");
         require(tokensIn <= sold, "cannot sell more than sold");
+        require(tokensIn <= boughtFromCurve[msg.sender], "can only sell tokens bought from curve");
 
         uint256 grossOut = sellQuoteFor(sold, tokensIn);
         require(grossOut > 0, "quote too small");
@@ -412,6 +437,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
         // CEI: update ALL state before ANY external calls (LOT-30)
         sold -= tokensIn;
+        boughtFromCurve[msg.sender] -= tokensIn;
         // AUDIT FIX (BUG-2,3,10): Track cumulative sell fees so rescueBNB solvency check
         // accounts for BNB that already left the contract as fees.
         totalSellFeesExtracted += fee;
@@ -431,10 +457,14 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
     // --- DEX Migration & Sweep ---
 
-    /// @notice AUDIT FIX (BUG-9): Migrate BNB to DEX after curve finishes. Since sells are blocked
-    /// after curveFinished (BUG-13 fix), no reserve is needed and all BNB can go to DEX LP.
-    function migrateLiquidity(address payable to) external onlyOwner {
+    /// @notice AUDIT FIX (BUG-9): Migrate BNB to DEX after curve finishes.
+    /// AUDIT FIX (HIGH-5): 24-hour timelock after curveFinished before migration is allowed.
+    /// This gives users time to react and prevents instant owner rug (markCurveFinished + migrateLiquidity).
+    /// AUDIT FIX (CRITICAL-3): nonReentrant prevents reentrancy via .call{value} callback.
+    function migrateLiquidity(address payable to) external onlyOwner nonReentrant {
         require(curveFinished, "not finished");
+        require(curveFinishedAt > 0, "finishedAt not set");
+        require(block.timestamp >= curveFinishedAt + MIGRATION_DELAY, "migration delay not met");
         require(to != payable(address(0)), "zero");
         uint256 balance = address(this).balance;
         require(balance > 0, "no BNB");
@@ -445,7 +475,8 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
     /// @notice AUDIT FIX (BUG-8): Time-locked sweep for BNB permanently stuck due to burned/lost tokens.
     /// Only available 180 days after curveFinished — gives token holders ample time to sell on DEX.
-    function sweepRemainingBNB(address payable to) external onlyOwner {
+    /// AUDIT FIX (CRITICAL-3): nonReentrant prevents reentrancy via .call{value} callback.
+    function sweepRemainingBNB(address payable to) external onlyOwner nonReentrant {
         require(curveFinished, "not finished");
         require(curveFinishedAt > 0, "finishedAt not set");
         require(block.timestamp >= curveFinishedAt + SWEEP_DELAY, "too early");

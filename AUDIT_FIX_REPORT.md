@@ -469,3 +469,68 @@ forge test --match-contract Test_BROKEN3 -vvv
 | Multi-buy dust insolvency (BUG-6) | Bounded | < 1 Gwei per buy — not exploitable |
 | Fixed P0/m constants (BUG-24) | Documented | Design choice — feed is informational only |
 | Sell blocked after finish (BROKEN-6) | By design | Users sell on DEX after `migrateLiquidity()` |
+
+---
+
+## Round 3 Fixes (Post-Fix Audit)
+
+### CRITICAL #1 — Creator Rug via sell() with Free 20% Tokens — FIXED
+
+- **Added** `mapping(address => uint256) public boughtFromCurve` to track tokens each address purchased through `buyWithBNB`.
+- **`sell()`** now requires `tokensIn <= boughtFromCurve[msg.sender]`. Creator's free 200M tokens cannot be sold through the curve.
+- **File:** `contracts/BondingCurve.sol` — `boughtFromCurve` state, `buyWithBNB` increments, `sell` checks and decrements
+- **Test:** `test_creator_cannot_sell_free_tokens()`, `test_buyer_can_sell_bought_tokens()`
+
+### CRITICAL #2 — Buy Fee Overcharged on Partial Fills — FIXED
+
+- Fee now computed on `actualCost` (what the user actually pays for tokens), not `msg.value`. On partial fills (curve exhausted), the user pays 1% of what they got, not 1% of what they sent.
+- **File:** `contracts/BondingCurve.sol` — `buyWithBNB` restructured: compute tokens first, then fee on `actualCost`
+- **Test:** `test_fee_not_overcharged_on_partial_fill()`
+
+### CRITICAL #3 — rescueBNB/migrateLiquidity Have No Reentrancy Guard — FIXED
+
+- Added `nonReentrant` modifier to `rescueBNB`, `migrateLiquidity`, and `sweepRemainingBNB`.
+- **File:** `contracts/BondingCurve.sol` — all three functions now `nonReentrant`
+
+### HIGH #4 — Anti-Sniper Weaponization (No Mandatory Lock) — FIXED
+
+- Both `TokenFactory` and `TokenFactoryWithCurve` now call `token.lockAntiSniperSettings()` before transferring ownership. Anti-sniper is auto-locked at deployment.
+- **File:** `contracts/TokenFactory.sol`, `contracts/TokenFactoryWithCurve.sol`
+- **Test:** `test_factory_auto_locks_anti_sniper()`, `test_token_factory_auto_locks()`
+
+### HIGH #5 — markCurveFinished + migrateLiquidity Instant Rug — FIXED
+
+- `markCurveFinished()` now requires `sold >= 50% of curveAllocation` before owner can manually finish.
+- `migrateLiquidity()` now requires 24-hour delay (`MIGRATION_DELAY`) after `curveFinishedAt` before BNB can be withdrawn.
+- **File:** `contracts/BondingCurve.sol` — `MIN_SOLD_PERCENT_TO_FINISH = 50`, `MIGRATION_DELAY = 24 hours`
+- **Test:** `test_cannot_finish_with_zero_sold()`, `test_cannot_finish_below_50_percent()`, `test_migration_blocked_before_delay()`
+
+### MEDIUM #6 — Chainlink Stale Feed DoS — FIXED
+
+- Added `tryGetLatestBNBPrice()` — non-reverting wrapper using try/catch. Returns 0 if feed is stale.
+- `calculateCurveParams()` uses `tryGetLatestBNBPrice()` instead of `getLatestBNBPrice()`. Stale feed returns `bnbPriceUSD = 0` (informational) but P0/m are still computed.
+- **File:** `contracts/BondingCurveFactory.sol`
+- **Test:** `test_stale_feed_does_not_block_createBondingCurve()`
+
+### MEDIUM #7 — Anti-Sniper Lock Bypass: Can Re-enable After Disabling — FIXED
+
+- When locked, `antiSniperEnabled` flag is **frozen** — `require(_antiSniperEnabled == antiSniperEnabled)`. Cannot disable OR re-enable.
+- `lockAntiSniperSettings()` now requires `antiSniperEnabled == true` to prevent locking while disabled (false confidence).
+- **File:** `contracts/MemeToken.sol`
+- **Test:** `test_cannot_change_enabled_flag_when_locked()`, `test_cannot_lock_while_disabled()`
+
+### MEDIUM #8 — MIN Bounds Enable Near-Free Purchases — FIXED
+
+- Increased `MIN_P0` and `MIN_M` from `1e6` to `1e9`. At 1e9: cost to buy all 800M tokens ≈ 1.2 BNB (~$720).
+- **File:** `contracts/TokenFactoryWithCurve.sol`
+- **Test:** `test_minimum_cost_is_meaningful()`
+
+### NEW-BUG-1 — Cooldown Griefing via Dust Transfers — FIXED
+
+- `lastTransferTime[to]` is now **only set when sender is excluded** (e.g., bonding curve). Regular user-to-user transfers do NOT reset the recipient's cooldown. Attackers can no longer lock victims by sending dust.
+- **File:** `contracts/MemeToken.sol` — `transfer()` and `transferFrom()` conditioned on `excludedFromLimits[from]`
+- **Test:** `test_dust_transfer_does_not_reset_victim_cooldown()`, `test_curve_buy_still_sets_buyer_cooldown()`
+
+### Dead Code — Refund-then-Revert in buyWithBNB — REMOVED
+
+- The `else if (actualCost > netQuote)` branch that refunded BNB then immediately reverted was dead code (revert rolls back the refund). Replaced with a simple `require(actualCost <= maxNetQuote, "quote short")`.

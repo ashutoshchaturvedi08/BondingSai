@@ -114,8 +114,6 @@ contract MemeToken is Ownable, ReentrancyGuard {
         
         if (antiSniperEnabled) {
             if (!excludedFromLimits[from]) {
-                // AUDIT FIX (BROKEN-5): Only enforce maxTransaction when `to` is NOT excluded.
-                // Selling to the bonding curve (excluded) should not be throttled by maxTransaction.
                 if (!excludedFromLimits[to]) {
                     require(value <= maxTransaction, "Transfer > maxTransaction");
                 }
@@ -124,8 +122,13 @@ contract MemeToken is Ownable, ReentrancyGuard {
             }
             if (!excludedFromLimits[to]) {
                 require(balanceOf[to] + value <= maxWallet, "Recipient > maxWallet");
-                // AUDIT FIX (BROKEN-3): Start cooldown for recipient so they can't immediately sell
-                lastTransferTime[to] = block.timestamp;
+                // AUDIT FIX (NEW-BUG-1): Only set recipient cooldown when sender is excluded (e.g.,
+                // bonding curve). Previously ANY transfer set lastTransferTime[to], enabling griefing
+                // where an attacker sends dust tokens to lock the victim's ability to transfer/sell.
+                // Now only curve-originating transfers (from=excluded) set the recipient's cooldown.
+                if (excludedFromLimits[from]) {
+                    lastTransferTime[to] = block.timestamp;
+                }
             }
         }
 
@@ -136,7 +139,7 @@ contract MemeToken is Ownable, ReentrancyGuard {
         return true;
     }
     
-    // AUDIT FIX (BUG-18, BROKEN-3, BROKEN-5): Same independent checks as transferFrom.
+    // AUDIT FIX (BUG-18, BROKEN-3, BROKEN-5, NEW-BUG-1): Same independent checks as transferFrom.
     function transfer(address to, uint256 value) external returns (bool) {
         require(balanceOf[msg.sender] >= value, "Insufficient balance");
         require(to != address(0), "Transfer to zero address");
@@ -151,7 +154,9 @@ contract MemeToken is Ownable, ReentrancyGuard {
             }
             if (!excludedFromLimits[to]) {
                 require(balanceOf[to] + value <= maxWallet, "Recipient > maxWallet");
-                lastTransferTime[to] = block.timestamp;
+                if (excludedFromLimits[msg.sender]) {
+                    lastTransferTime[to] = block.timestamp;
+                }
             }
         }
 
@@ -162,8 +167,11 @@ contract MemeToken is Ownable, ReentrancyGuard {
         return true;
     }
     
-    /// LOT-34 (Audit Round 2): Lock anti-sniper so only relaxing is allowed (prevents owner from blocking sells via maxTx=1 etc.)
+    /// LOT-34 (Audit Round 2): Lock anti-sniper so only relaxing is allowed.
+    /// AUDIT FIX (MEDIUM-7): Require anti-sniper to be enabled when locking. Locking while disabled
+    /// creates false user confidence (antiSniperLocked=true but protection is OFF).
     function lockAntiSniperSettings() external onlyOwner {
+        require(antiSniperEnabled, "must be enabled to lock");
         antiSniperLocked = true;
     }
 
@@ -180,9 +188,10 @@ contract MemeToken is Ownable, ReentrancyGuard {
         require(_cooldownPeriod > 0, "Cooldown period must be greater than 0");
 
         if (antiSniperLocked) {
-            // AUDIT FIX (BROKEN-4): Prevent disabling anti-sniper when locked. Previously the enabled
-            // flag was not checked, allowing owner to set antiSniperEnabled=false despite the lock.
-            require(_antiSniperEnabled || !antiSniperEnabled, "cannot disable anti-sniper when locked");
+            // AUDIT FIX (BROKEN-4 + MEDIUM-7): When locked, the enabled flag cannot change at all.
+            // Disabling is prevented (BROKEN-4) and re-enabling after disabling is also prevented
+            // (MEDIUM-7). The state at lock time is frozen for the enabled flag.
+            require(_antiSniperEnabled == antiSniperEnabled, "cannot change enabled flag when locked");
             uint256 maxWalletUnscaled = maxWallet / (10 ** decimals);
             uint256 maxTxUnscaled = maxTransaction / (10 ** decimals);
             require(_maxWallet >= maxWalletUnscaled, "cannot reduce maxWallet when locked");

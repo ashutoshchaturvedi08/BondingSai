@@ -13,12 +13,12 @@ contract TokenFactoryWithCurve is Ownable {
     address public immutable feeRecipient;
 
     // LOT-12 (Audit): Bounds for P0 and m to prevent free/flat curves and overflow
-    // AUDIT FIX (BUG-19): Increased MIN_P0 and MIN_M from 1 to 1e6. With MIN=1 (1 wei in WAD),
-    // P0 = 0.000000000000000001 BNB/token — effectively free. 1e6 ensures a minimum meaningful price
-    // of ~0.000000000001 BNB/token, preventing sub-dust economics that offer no economic protection.
-    uint256 public constant MIN_P0 = 1e6;
+    // AUDIT FIX (MEDIUM-8): Increased MIN_P0 and MIN_M to 1e9. At 1e6 the cost to buy ALL 800M curve
+    // tokens was ~0.00084 BNB (<$1), enabling near-free token acquisition for PancakeSwap rug.
+    // At 1e9: buyQuoteFor(0, 8e26) ≈ 1.2 BNB (~$720) — meaningful economic protection.
+    uint256 public constant MIN_P0 = 1e9;
     uint256 public constant MAX_P0 = 1e18;
-    uint256 public constant MIN_M = 1e6;
+    uint256 public constant MIN_M = 1e9;
     uint256 public constant MAX_M = 100e18;
 
     event TokenCreated(address tokenAddress, address creator, string name, string symbol);
@@ -96,6 +96,10 @@ contract TokenFactoryWithCurve is Ownable {
         token.setExcludedFromLimits(curveAddress, true);
         // LOT-29 (Audit Round 2): Defense-in-depth — verify exclusion was applied before handing off ownership
         require(token.isExcludedFromLimits(curveAddress), "curve exclusion failed");
+        // AUDIT FIX (HIGH-4): Auto-lock anti-sniper settings at deployment. Without this, the owner
+        // can weaponize anti-sniper by setting maxTx=1 wei to freeze all non-excluded addresses.
+        // Locking ensures the owner can only relax limits after deployment, never tighten them.
+        token.lockAntiSniperSettings();
         token.transferOwnership(msg.sender);
 
         emit TokenCreated(tokenAddress, msg.sender, _name, _symbol);
