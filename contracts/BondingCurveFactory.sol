@@ -25,7 +25,11 @@ contract BondingCurveFactory is Ownable {
     
     uint256 public constant START_MARKET_CAP_USD = 5000; // $5,000 (initial market cap at start)
     uint256 public constant END_MARKET_CAP_USD = 76963; // ~$76,963 (target market cap at end, matching four.meme)
-    uint256 public constant CURVE_TOKENS = 1_000_000_000; // 1B tokens total (800M tradable, 200M locked for DEX)
+    uint256 public constant TOTAL_TOKENS = 1_000_000_000; // 1B tokens total
+    // AUDIT FIX (BROKEN-1): Was CURVE_TOKENS = 1B, but TokenFactory only funds 80% (800M) to the curve.
+    // curveAllocation must match the actual funded amount, otherwise sold can never reach curveAllocation,
+    // curveFinished never auto-fires, and migrateLiquidity() is permanently stuck.
+    uint256 public constant CURVE_PERCENT = 80; // 80% of total supply goes to curve
     // LOT-15 (Audit): Removed unused TRADABLE_TOKENS constant
     uint256 public constant STALENESS_THRESHOLD = 3600; // LOT-04 (Audit): 1 hour - BNB/USD feed heartbeat ~60s
     // Target initial price in BNB (matching four.meme: 0.000000005798 BNB per token)
@@ -132,7 +136,8 @@ contract BondingCurveFactory is Ownable {
         // m_wad = 2 * (Cost - (P0 * ds) / WAD) * curveAllocation * WAD / ds^2
         uint256 targetTokensSold = 147_334_426 * (10 ** 18); // In raw token units (WAD)
         uint256 targetCostWei = 99 * (10 ** 16); // 0.99 BNB net (after 1% fee from 1 BNB input)
-        uint256 curveAllocation = CURVE_TOKENS * (10 ** 18); // 1B tokens in raw units (18 decimals)
+        // AUDIT FIX (BROKEN-1): Use 80% of total supply to match actual funded amount
+        uint256 curveAllocation = (TOTAL_TOKENS * (10 ** 18) * CURVE_PERCENT) / 100;
         
         // P0 term: (P0 * ds) / WAD (in wei)
         uint256 p0TermWei = (p0_wad * targetTokensSold) / WAD;
@@ -229,9 +234,9 @@ contract BondingCurveFactory is Ownable {
 
         // Calculate curve parameters using real-time BNB price from Chainlink
         (uint256 p0_wad, uint256 m_wad, uint256 bnbPriceUSD) = calculateCurveParams();
-        // Use 1B tokens in curve (flatter curve), but only 800M will be tradable
-        // The remaining 200M are locked and will go to DEX when curve finishes
-        uint256 curveAllocation = CURVE_TOKENS * (10 ** _tokenDecimals);
+        // AUDIT FIX (BROKEN-1): curveAllocation = 80% of total supply, matching what TokenFactory actually funds.
+        // The remaining 20% goes to the creator for DEX LP seeding after curve finishes.
+        uint256 curveAllocation = (TOTAL_TOKENS * (10 ** _tokenDecimals) * CURVE_PERCENT) / 100;
 
         BondingCurveBNB curve = new BondingCurveBNB(
             _token,

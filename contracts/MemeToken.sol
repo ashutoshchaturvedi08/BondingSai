@@ -97,10 +97,12 @@ contract MemeToken is Ownable, ReentrancyGuard {
     }
 
     // LOT-16 (Audit): Removed nonReentrant — no external calls in transfer; saves gas and allows use inside other nonReentrant flows
-    // AUDIT FIX (BUG-18): Check sender and recipient limits independently. Previously, when the sender
-    // was excluded (e.g., the bonding curve), ALL limits were bypassed including maxWallet on the recipient.
-    // Now: sender exclusion only skips sender-side checks (maxTransaction, cooldown). Recipient maxWallet
-    // is always enforced unless the recipient is also excluded.
+    // AUDIT FIX (BUG-18): Check sender and recipient limits independently.
+    // AUDIT FIX (BROKEN-3): Set lastTransferTime[to] for non-excluded recipients so buyers from the
+    // bonding curve cannot immediately dump — their cooldown starts when they receive tokens.
+    // AUDIT FIX (BROKEN-5): Skip maxTransaction on sender when `to` is excluded (e.g., bonding curve).
+    // Without this, selling to the curve is throttled by maxTransaction, forcing users into slow drip-sells
+    // during a dump while their tokens lose value.
     function transferFrom(address from, address to, uint256 value) external returns (bool) {
         require(balanceOf[from] >= value, "Insufficient balance");
         require(to != address(0), "Transfer to zero address");
@@ -112,12 +114,18 @@ contract MemeToken is Ownable, ReentrancyGuard {
         
         if (antiSniperEnabled) {
             if (!excludedFromLimits[from]) {
-                require(value <= maxTransaction, "Transfer > maxTransaction");
+                // AUDIT FIX (BROKEN-5): Only enforce maxTransaction when `to` is NOT excluded.
+                // Selling to the bonding curve (excluded) should not be throttled by maxTransaction.
+                if (!excludedFromLimits[to]) {
+                    require(value <= maxTransaction, "Transfer > maxTransaction");
+                }
                 require(block.timestamp - lastTransferTime[from] >= cooldownPeriod, "Cooldown active");
                 lastTransferTime[from] = block.timestamp;
             }
             if (!excludedFromLimits[to]) {
                 require(balanceOf[to] + value <= maxWallet, "Recipient > maxWallet");
+                // AUDIT FIX (BROKEN-3): Start cooldown for recipient so they can't immediately sell
+                lastTransferTime[to] = block.timestamp;
             }
         }
 
@@ -128,19 +136,22 @@ contract MemeToken is Ownable, ReentrancyGuard {
         return true;
     }
     
-    // AUDIT FIX (BUG-18): Same independent sender/recipient limit checks as transferFrom.
+    // AUDIT FIX (BUG-18, BROKEN-3, BROKEN-5): Same independent checks as transferFrom.
     function transfer(address to, uint256 value) external returns (bool) {
         require(balanceOf[msg.sender] >= value, "Insufficient balance");
         require(to != address(0), "Transfer to zero address");
 
         if (antiSniperEnabled) {
             if (!excludedFromLimits[msg.sender]) {
-                require(value <= maxTransaction, "Transfer > maxTransaction");
+                if (!excludedFromLimits[to]) {
+                    require(value <= maxTransaction, "Transfer > maxTransaction");
+                }
                 require(block.timestamp - lastTransferTime[msg.sender] >= cooldownPeriod, "Cooldown active");
                 lastTransferTime[msg.sender] = block.timestamp;
             }
             if (!excludedFromLimits[to]) {
                 require(balanceOf[to] + value <= maxWallet, "Recipient > maxWallet");
+                lastTransferTime[to] = block.timestamp;
             }
         }
 
@@ -169,6 +180,9 @@ contract MemeToken is Ownable, ReentrancyGuard {
         require(_cooldownPeriod > 0, "Cooldown period must be greater than 0");
 
         if (antiSniperLocked) {
+            // AUDIT FIX (BROKEN-4): Prevent disabling anti-sniper when locked. Previously the enabled
+            // flag was not checked, allowing owner to set antiSniperEnabled=false despite the lock.
+            require(_antiSniperEnabled || !antiSniperEnabled, "cannot disable anti-sniper when locked");
             uint256 maxWalletUnscaled = maxWallet / (10 ** decimals);
             uint256 maxTxUnscaled = maxTransaction / (10 ** decimals);
             require(_maxWallet >= maxWalletUnscaled, "cannot reduce maxWallet when locked");
