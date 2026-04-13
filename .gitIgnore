@@ -1,0 +1,94 @@
+# Foundry
+cache/
+forge-cache/
+out/
+forge-out/
+artifacts/
+*.sol.md
+
+# Hardhat
+node_modules/
+dist/
+build/
+.hardhat/
+typechain/
+typechain-types/
+
+# Dependencies
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+.env.prod
+.env.production
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+.eslintcache
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Testing
+.coverage
+coverage/
+.nyc_output/
+
+# Compiled files
+*.js.map
+*.d.ts
+
+# OS
+.DS_Store
+Thumbs.db
+.env.example
+
+# Temp files
+.tmp/
+temp/
+tmp/
+
+# Build outputs
+dist/
+build/
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Yarn
+.yarn/
+!.yarn/releases
+!.yarn/plugins
+!.yarn/sdks
+!.yarn/versions
+
+# Misc
+*.tgz
+*.tar.gz
+.pnp
+.pnp.js

@@ -10,6 +10,7 @@ import "./BondingCurveFactory.sol";
 contract TokenFactory is Ownable {
     using SafeERC20 for IERC20;
     BondingCurveFactory public bondingCurveFactory;
+    address public immutable migrator;
     
     event TokenCreated(address tokenAddress, address creator, string name, string symbol);
     event TokenWithBondingCurveCreated(
@@ -20,9 +21,11 @@ contract TokenFactory is Ownable {
         string symbol
     );
     
-    constructor(address _bondingCurveFactory) {
+    constructor(address _bondingCurveFactory, address _migrator) {
         require(_bondingCurveFactory != address(0), "bondingCurveFactory 0");
+        require(_migrator != address(0), "migrator 0");
         bondingCurveFactory = BondingCurveFactory(_bondingCurveFactory);
+        migrator = _migrator;
         _transferOwnership(msg.sender);
     }
     
@@ -152,7 +155,8 @@ contract TokenFactory is Ownable {
         bondingCurveAddress = bondingCurveFactory.createBondingCurve(
             tokenAddress,
             _decimals,
-            msg.sender
+            msg.sender,
+            migrator
         );
 
         IERC20(tokenAddress).safeTransfer(bondingCurveAddress, curveAllocation);

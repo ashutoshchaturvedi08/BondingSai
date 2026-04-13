@@ -239,7 +239,8 @@ contract BondingCurveFactory is Ownable {
     function createBondingCurve(
         address _token,
         uint8 _tokenDecimals,
-        address _owner
+        address _owner,
+        address _migrator
     ) external onlyAuthorized returns (address bondingCurve) {
         require(_token != address(0), "token 0");
         require(_owner != address(0), "owner 0");
@@ -258,7 +259,8 @@ contract BondingCurveFactory is Ownable {
             m_wad,
             curveAllocation,
             feeRecipient,
-            _owner
+            _owner,
+            _migrator
         );
 
         bondingCurve = address(curve);

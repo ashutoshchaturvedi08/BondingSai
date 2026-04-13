@@ -11,6 +11,7 @@ contract TokenFactoryWithCurve is Ownable {
     using SafeERC20 for IERC20;
 
     address public immutable feeRecipient;
+    address public immutable migrator;
 
     // LOT-12 (Audit): Bounds for P0 and m to prevent free/flat curves and overflow
     // AUDIT FIX (MEDIUM-8): Increased MIN_P0 and MIN_M to 1e9. At 1e6 the cost to buy ALL 800M curve
@@ -24,9 +25,11 @@ contract TokenFactoryWithCurve is Ownable {
     event TokenCreated(address tokenAddress, address creator, string name, string symbol);
     event BondingCurveCreated(address tokenAddress, address curveAddress);
 
-    constructor(address _feeRecipient) {
+    constructor(address _feeRecipient, address _migrator) {
         require(_feeRecipient != address(0), "feeRecipient 0");
+        require(_migrator != address(0), "migrator 0");
         feeRecipient = _feeRecipient;
+        migrator = _migrator;
         _transferOwnership(msg.sender);
     }
 
@@ -84,7 +87,8 @@ contract TokenFactoryWithCurve is Ownable {
             _m_wad,
             curveAllocation,
             feeRecipient,
-            msg.sender
+            msg.sender,
+            migrator
         );
         curveAddress = address(curve);
 

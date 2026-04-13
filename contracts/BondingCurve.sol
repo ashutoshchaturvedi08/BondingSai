@@ -32,11 +32,21 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
     // LOT-17 (Audit): P0 and m declared immutable - set only in constructor, gas savings on every quote read
     // Curve parameters (price units = BNB wei scaled as WAD)
-    uint256 public immutable P0;   // starting price per token (WAD), equals (startFDV / totalSupply) * WAD
-    uint256 public immutable m;    // slope (WAD per token)
-    uint256 public sold;           // tokens sold so far (raw token units)
+    uint256 public immutable P0; // starting price per token (WAD), equals (startFDV / totalSupply) * WAD
+    uint256 public immutable m; // slope (WAD per token)
+    uint256 public sold; // tokens sold so far (raw token units)
     uint256 public immutable curveAllocation; // total tokens allocated to this curve (raw units)
     bool public curveFinished;
+    address public migrator;
+
+    modifier onlyMigrator() {
+        _onlyMigrator();
+        _;
+    }
+
+    function _onlyMigrator() internal view {
+        require(msg.sender == migrator, "Not migrator");
+    }
 
     // AUDIT FIX (BUG-2,3,10): Track cumulative sell fees extracted from contract to adjust solvency checks
     uint256 public totalSellFeesExtracted;
@@ -57,8 +67,18 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     uint256 public constant MIN_SOLD_PERCENT_TO_FINISH = 50;
 
     event DepositedTokens(address indexed from, uint256 amount);
-    event Buy(address indexed buyer, uint256 bnbIn, uint256 tokensOut, uint256 fee);
-    event Sell(address indexed seller, uint256 tokensIn, uint256 bnbOut, uint256 fee);
+    event Buy(
+        address indexed buyer,
+        uint256 bnbIn,
+        uint256 tokensOut,
+        uint256 fee
+    );
+    event Sell(
+        address indexed seller,
+        uint256 tokensIn,
+        uint256 bnbOut,
+        uint256 fee
+    );
     event CurveFinished(uint256 sold);
     event LiquidityMigrated(address indexed to, uint256 amount);
     event BNBSwept(address indexed to, uint256 amount);
@@ -72,10 +92,12 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         uint256 _m_wad,
         uint256 _curveAllocation,
         address _feeRecipient,
-        address _owner
+        address _owner,
+        address _migrator
     ) payable {
         require(_token != address(0), "token 0");
         require(_feeRecipient != address(0), "feeRecipient 0");
+        require(_migrator != address(0), "migrator 0");
 
         // AUDIT FIX (BUG-17): Reject degenerate curve parameters that produce broken/free curves
         require(_P0_wad > 0, "P0 must be > 0");
@@ -83,17 +105,22 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         require(_curveAllocation > 0, "curveAllocation must be > 0");
 
         // AUDIT FIX (BUG-22): Bonding curve math requires 18-decimal tokens; reject non-18
-        require(IERC20Metadata(_token).decimals() == 18, "requires 18 decimals");
+        require(
+            IERC20Metadata(_token).decimals() == 18,
+            "requires 18 decimals"
+        );
 
         if (msg.value >= 1) {
-            (bool ok,) = payable(_feeRecipient).call{value: 1}("");
+            (bool ok, ) = payable(_feeRecipient).call{value: 1}("");
             require(ok, "feeRecipient cannot receive BNB");
             if (msg.value > 1) {
-                (bool refund,) = payable(msg.sender).call{value: msg.value - 1}("");
+                (bool refund, ) = payable(msg.sender).call{
+                    value: msg.value - 1
+                }("");
                 require(refund, "refund failed");
             }
         } else {
-            (bool testSend,) = payable(_feeRecipient).call{value: 0}("");
+            (bool testSend, ) = payable(_feeRecipient).call{value: 0}("");
             require(testSend, "feeRecipient cannot receive BNB");
         }
         token = IERC20(_token);
@@ -101,16 +128,19 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         m = _m_wad;
         curveAllocation = _curveAllocation;
         feeRecipient = _feeRecipient;
+        migrator = _migrator;
         _transferOwnership(_owner);
     }
 
     // Get current market cap in USD (approximate, based on BNB price)
     // This is a view function for reference - actual pricing is in BNB
     // Market cap = Current Price × Total Supply (curveAllocation)
-    function getCurrentMarketCapUSD(uint256 bnbPriceUSD) external view returns (uint256) {
+    function getCurrentMarketCapUSD(
+        uint256 bnbPriceUSD
+    ) external view returns (uint256) {
         // Calculate current price at the current sold amount
         uint256 currentPriceBNB = priceAt(sold); // Price in BNB (WAD scaled)
-        
+
         // Market cap = currentPriceBNB × curveAllocation × bnbPriceUSD / (WAD × WAD)
         // currentPriceBNB is in WAD (18 decimals)
         // curveAllocation is in raw token units (18 decimals)
@@ -118,7 +148,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         // Result: (WAD × WAD × WAD) / (WAD × WAD) = WAD (18 decimals) ✓
         uint256 currentPriceUSD = (currentPriceBNB * bnbPriceUSD) / WAD; // Price in USD per token (WAD scaled)
         uint256 marketCapUSD = (currentPriceUSD * curveAllocation) / WAD; // Total market cap in USD (WAD scaled)
-        
+
         return marketCapUSD;
     }
 
@@ -172,15 +202,18 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     /// of splitting exceeds the rounding profit. Similarly (BUG-12), splitting sells into smaller
     /// chunks compounds rounding loss. Both are inherent to discrete-step binary search over an
     /// integer integral. Math.mulDiv in _quadraticTerm minimizes but cannot eliminate this.
-    function tokensForQuote(uint256 s, uint256 netQuote) public view returns (uint256) {
+    function tokensForQuote(
+        uint256 s,
+        uint256 netQuote
+    ) public view returns (uint256) {
         if (netQuote == 0) return 0;
         uint256 remaining = curveAllocation - s;
         if (remaining == 0) return 0;
-        
+
         // Calculate upper bound using linear estimate
         uint256 currentPrice = priceAt(s);
         if (currentPrice == 0) return 0;
-        
+
         // Linear estimate: tokens ≈ (netQuote * WAD) / currentPrice
         // currentPrice is in WAD (price per token scaled by WAD)
         // netQuote is in wei (BNB wei)
@@ -195,28 +228,30 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
             if (priceInWei == 0) return 0; // Price too small
             linearEstimate = netQuote / priceInWei;
         }
-        
-        uint256 upperBound = linearEstimate < remaining ? linearEstimate : remaining;
+
+        uint256 upperBound = linearEstimate < remaining
+            ? linearEstimate
+            : remaining;
         if (upperBound == 0) return 0;
-        
+
         // Binary search: find maximum tokens that can be bought
         if (upperBound == 0) return 0;
-        
+
         uint256 low = 1;
         uint256 high = upperBound;
         uint256 answer = 0;
         // LOT-27 (Audit): 128 iterations sufficient for full uint256 range; reduces unpredictable gas
         uint256 maxIterations = 128;
-        
+
         // Standard binary search to find the maximum tokens we can buy
         while (low <= high && maxIterations > 0) {
             maxIterations--;
             uint256 mid = (low + high) / 2;
-            
+
             if (mid == 0) break;
-            
+
             uint256 cost = buyQuoteFor(s, mid);
-            
+
             if (cost <= netQuote) {
                 answer = mid;
                 if (low == high) break;
@@ -227,7 +262,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
                 high = mid - 1;
             }
         }
-        
+
         // Validate the answer
         if (answer > 0) {
             uint256 answerCost = buyQuoteFor(s, answer);
@@ -250,7 +285,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
             }
             return answer;
         }
-        
+
         // Binary search didn't find anything - this shouldn't happen if linear estimate is correct
         // But try one more time with a smaller upper bound
         // Check if we can buy at least 1 wei
@@ -260,7 +295,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
             // Start from a minimum that we know works
             uint256 minTokens = 1;
             uint256 maxTokens = upperBound;
-            
+
             // Find the maximum by checking powers of 2
             uint256 testAmount = minTokens;
             while (testAmount <= maxTokens) {
@@ -273,16 +308,16 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
                     break;
                 }
             }
-            
+
             // Now binary search between answer and answer*2 (or maxTokens)
             if (answer > 0) {
                 low = answer;
                 high = (answer * 2 < maxTokens) ? answer * 2 : maxTokens;
-                
+
                 for (uint256 i = 0; i < 100 && low <= high; i++) {
                     uint256 mid = (low + high) / 2;
                     uint256 cost = buyQuoteFor(s, mid);
-                    
+
                     if (cost > 0 && cost <= netQuote) {
                         answer = mid;
                         if (low == high) break;
@@ -294,7 +329,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
                 }
             }
         }
-        
+
         return answer;
     }
 
@@ -302,7 +337,9 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
     /// owner must pre-fund the curve with tokens
     /// LOT-31 (Audit Round 2): Use SafeERC20 for compatibility with non-standard ERC-20 (e.g. USDT that doesn't return bool)
-    function depositCurveTokens(uint256 amount) external nonReentrant onlyOwner {
+    function depositCurveTokens(
+        uint256 amount
+    ) external nonReentrant onlyOwner {
         require(amount > 0, "amount>0");
         token.safeTransferFrom(msg.sender, address(this), amount);
         emit DepositedTokens(msg.sender, amount);
@@ -315,12 +352,19 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         require(to != address(0), "zero");
         uint256 activeBalance = curveAllocation - sold;
         uint256 currentBalance = token.balanceOf(address(this));
-        require(currentBalance - amount >= activeBalance, "cannot withdraw active tokens");
+        require(
+            currentBalance - amount >= activeBalance,
+            "cannot withdraw active tokens"
+        );
         token.safeTransfer(to, amount);
     }
 
     // LOT-06 (Audit): Cannot rescue curve's own token; other ERC20 only (e.g. airdrops)
-    function rescueERC20(address tokenAddr, address to, uint256 amount) external onlyOwner {
+    function rescueERC20(
+        address tokenAddr,
+        address to,
+        uint256 amount
+    ) external onlyOwner {
         require(tokenAddr != address(token), "cannot rescue curve token");
         IERC20(tokenAddr).safeTransfer(to, amount);
     }
@@ -328,15 +372,21 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // AUDIT FIX (BUG-14): Guard against underflow when amount > balance (was Panic(0x11), now readable error).
     // AUDIT FIX (BUG-2,3,10): Subtract totalSellFeesExtracted from required reserve — fees already left the contract.
     // AUDIT FIX (CRITICAL-3): nonReentrant prevents reentrancy via .call{value} callback.
-    function rescueBNB(address payable to, uint256 amount) external onlyOwner nonReentrant {
+    function rescueBNB(
+        address payable to,
+        uint256 amount
+    ) external onlyOwner nonReentrant {
         require(to != payable(address(0)), "zero");
         require(amount <= address(this).balance, "insufficient balance");
         uint256 grossRequired = sellQuoteFor(sold, sold);
         uint256 requiredBNB = grossRequired > totalSellFeesExtracted
             ? grossRequired - totalSellFeesExtracted
             : 0;
-        require(address(this).balance - amount >= requiredBNB, "would make curve insolvent");
-        (bool sent,) = to.call{value: amount}("");
+        require(
+            address(this).balance - amount >= requiredBNB,
+            "would make curve insolvent"
+        );
+        (bool sent, ) = to.call{value: amount}("");
         require(sent, "BNB send failed");
     }
 
@@ -361,7 +411,10 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // LOT-21 (Audit): deadline prevents stale transactions (e.g. Four.Meme-style sandwich on BSC)
     // AUDIT FIX (CRITICAL-2): Fee is now computed on actualCost (what the user actually pays for tokens),
     // not on msg.value. On partial fills the user was overcharged up to 3.3x. Now fee = 1% of actualCost only.
-    function buyWithBNB(uint256 minTokensOut, uint256 deadline) external payable nonReentrant {
+    function buyWithBNB(
+        uint256 minTokensOut,
+        uint256 deadline
+    ) external payable nonReentrant {
         require(block.timestamp <= deadline, "transaction expired");
         require(!curveFinished, "curve finished");
         require(msg.value > 0, "send BNB");
@@ -383,12 +436,12 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
         if (totalCharged < msg.value) {
             uint256 refund = msg.value - totalCharged;
-            (bool sent,) = payable(msg.sender).call{value: refund}("");
+            (bool sent, ) = payable(msg.sender).call{value: refund}("");
             require(sent, "refund failed");
         }
 
         if (fee > 0) {
-            (bool ok,) = payable(feeRecipient).call{value: fee}("");
+            (bool ok, ) = payable(feeRecipient).call{value: fee}("");
             require(ok, "fee transfer failed");
         }
 
@@ -419,12 +472,19 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     // AUDIT FIX (BUG-13,16): Block sells after curveFinished to protect BNB reserved for DEX migration.
     // AUDIT FIX (CRITICAL-1): Only tokens purchased through buyWithBNB can be sold back. This prevents
     // the creator from selling their free 20% allocation to drain all buyer BNB.
-    function sell(uint256 tokensIn, uint256 minQuoteOut, uint256 deadline) external nonReentrant {
+    function sell(
+        uint256 tokensIn,
+        uint256 minQuoteOut,
+        uint256 deadline
+    ) external nonReentrant {
         require(block.timestamp <= deadline, "transaction expired");
         require(!curveFinished, "curve finished"); // AUDIT FIX (BUG-13,16)
         require(tokensIn > 0, "zero tokens");
         require(tokensIn <= sold, "cannot sell more than sold");
-        require(tokensIn <= boughtFromCurve[msg.sender], "can only sell tokens bought from curve");
+        require(
+            tokensIn <= boughtFromCurve[msg.sender],
+            "can only sell tokens bought from curve"
+        );
 
         uint256 grossOut = sellQuoteFor(sold, tokensIn);
         require(grossOut > 0, "quote too small");
@@ -444,11 +504,11 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
         token.safeTransferFrom(msg.sender, address(this), tokensIn);
 
-        (bool sent,) = payable(msg.sender).call{value: netOut}("");
+        (bool sent, ) = payable(msg.sender).call{value: netOut}("");
         require(sent, "pay seller failed");
 
         if (fee > 0) {
-            (bool ok,) = payable(feeRecipient).call{value: fee}("");
+            (bool ok, ) = payable(feeRecipient).call{value: fee}("");
             require(ok, "fee transfer failed");
         }
 
@@ -461,28 +521,37 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     /// AUDIT FIX (HIGH-5): 24-hour timelock after curveFinished before migration is allowed.
     /// This gives users time to react and prevents instant owner rug (markCurveFinished + migrateLiquidity).
     /// AUDIT FIX (CRITICAL-3): nonReentrant prevents reentrancy via .call{value} callback.
-    function migrateLiquidity(address payable to) external onlyOwner nonReentrant {
+    function migrateLiquidity() external onlyMigrator nonReentrant {
         require(curveFinished, "not finished");
         require(curveFinishedAt > 0, "finishedAt not set");
-        require(block.timestamp >= curveFinishedAt + MIGRATION_DELAY, "migration delay not met");
-        require(to != payable(address(0)), "zero");
+        require(
+            block.timestamp >= curveFinishedAt + MIGRATION_DELAY,
+            "migration delay not met"
+        );
+        require(migrator != payable(address(0)), "zero");
+        uint256 tokenBalance = IERC20(token).balanceOf(address(this));
+        require(tokenBalance > 0, "No tokens");
         uint256 balance = address(this).balance;
         require(balance > 0, "no BNB");
-        (bool ok,) = to.call{value: balance}("");
+        (bool ok, ) = migrator.call{value: balance}("");
         require(ok, "transfer failed");
-        emit LiquidityMigrated(to, balance);
+        // 4. Transfer tokens
+        IERC20(token).transfer(migrator, tokenBalance);
+        emit LiquidityMigrated(migrator, balance);
     }
 
     /// @notice AUDIT FIX (BUG-8): Time-locked sweep for BNB permanently stuck due to burned/lost tokens.
     /// Only available 180 days after curveFinished — gives token holders ample time to sell on DEX.
     /// AUDIT FIX (CRITICAL-3): nonReentrant prevents reentrancy via .call{value} callback.
-    function sweepRemainingBNB(address payable to) external onlyOwner nonReentrant {
+    function sweepRemainingBNB(
+        address payable to
+    ) external onlyOwner nonReentrant {
         require(curveFinished, "not finished");
         require(curveFinishedAt > 0, "finishedAt not set");
         require(block.timestamp >= curveFinishedAt + SWEEP_DELAY, "too early");
         require(to != payable(address(0)), "zero");
         uint256 balance = address(this).balance;
-        (bool ok,) = to.call{value: balance}("");
+        (bool ok, ) = to.call{value: balance}("");
         require(ok, "transfer failed");
         emit BNBSwept(to, balance);
     }
