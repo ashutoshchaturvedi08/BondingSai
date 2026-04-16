@@ -1,0 +1,270 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.28;
+
+import "./BondingCurve.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+
+/**
+ * @title BondingCurveFactory
+ * @notice Factory contract to deploy bonding curves for tokens
+ * @dev Automatically calculates bonding curve parameters based on USD market cap targets
+ * @dev Uses Chainlink Price Feed to get real-time BNB/USD price
+ */
+contract BondingCurveFactory is Ownable {
+    address public immutable feeRecipient;
+    AggregatorV3Interface public immutable bnbPriceFeed;
+
+    // LOT-33 (Audit Round 2): Restrict createBondingCurve to authorized callers (e.g. TokenFactory) to prevent spam/fraud
+    mapping(address => bool) public authorizedCallers;
+
+    modifier onlyAuthorized() {
+        require(authorizedCallers[msg.sender] || msg.sender == owner(), "unauthorized");
+        _;
+    }
+    
+    uint256 public constant START_MARKET_CAP_USD = 5000; // $5,000 (initial market cap at start)
+    uint256 public constant END_MARKET_CAP_USD = 76963; // ~$76,963 (target market cap at end, matching four.meme)
+    uint256 public constant TOTAL_TOKENS = 1_000_000_000; // 1B tokens total
+    // AUDIT FIX (BROKEN-1): Was CURVE_TOKENS = 1B, but TokenFactory only funds 80% (800M) to the curve.
+    // curveAllocation must match the actual funded amount, otherwise sold can never reach curveAllocation,
+    // curveFinished never auto-fires, and migrateLiquidity() is permanently stuck.
+    uint256 public constant CURVE_PERCENT = 80; // 80% of total supply goes to curve
+    // LOT-15 (Audit): Removed unused TRADABLE_TOKENS constant
+    uint256 public constant STALENESS_THRESHOLD = 3600; // LOT-04 (Audit): 1 hour - BNB/USD feed heartbeat ~60s
+    // Target initial price in BNB (matching four.meme: 0.000000005798 BNB per token)
+    // From four.meme expected amounts:
+    //   - 0.00099 BNB → 170,734 tokens → P0 ≈ 5.798e-9
+    //   - 0.0099 BNB → 1,704,902 tokens
+    //   - 0.099 BNB → 16,808,861 tokens
+    //   - 0.99 BNB → 147,334,426 tokens
+    uint256 public constant TARGET_P0_BNB_NUMERATOR = 1798; // 0.000000005798 = 5798 / 1e12
+    uint256 public constant TARGET_P0_BNB_DENOMINATOR = 1e12;
+    uint256 public constant WAD = 1e18;
+    uint256 public constant PRICE_FEED_DECIMALS = 8; // Chainlink price feeds use 8 decimals
+
+    event BondingCurveCreated(
+        address indexed token,
+        address indexed bondingCurve,
+        uint256 p0_wad,
+        uint256 m_wad,
+        uint256 curveAllocation,
+        uint256 bnbPriceUSD
+    );
+    event AuthorizedCallerSet(address indexed caller, bool authorized);
+
+    /**
+     * @param _feeRecipient Address to receive 1% fees from buy/sell
+     * @param _bnbPriceFeed Address of Chainlink BNB/USD price feed
+     *                      BSC Mainnet: 0x0567F2323251f0Aab15c8dFbB7a6333D0d8771a3
+     *                      BSC Testnet: Check Chainlink docs for testnet address
+     */
+    constructor(address _feeRecipient, address _bnbPriceFeed) {
+        require(_feeRecipient != address(0), "feeRecipient 0");
+        require(_bnbPriceFeed != address(0), "priceFeed 0");
+        feeRecipient = _feeRecipient;
+        bnbPriceFeed = AggregatorV3Interface(_bnbPriceFeed);
+        _transferOwnership(msg.sender);
+    }
+
+    /**
+     * @notice Get latest BNB price from Chainlink Price Feed
+     * LOT-04 (Audit): Staleness validation via updatedAt; roundId check.
+     * AUDIT FIX (BUG-23): Validate answeredInRound >= roundId to reject stale carried-over answers.
+     * Chainlink V3 still returns answeredInRound; when answeredInRound < roundId the price was
+     * carried forward from an earlier round without a fresh update.
+     * @return price BNB price in USD with 18 decimals (WAD)
+     */
+    function getLatestBNBPrice() public view returns (uint256 price) {
+        (
+            uint80 roundId,
+            int256 rawPrice,
+            /* uint startedAt */,
+            uint256 updatedAt,
+            uint80 answeredInRound
+        ) = bnbPriceFeed.latestRoundData();
+
+        require(rawPrice > 0, "Invalid price");
+        require(roundId != 0, "Invalid round");
+        require(updatedAt != 0 && updatedAt <= block.timestamp, "Invalid timestamp");
+        require(block.timestamp - updatedAt <= STALENESS_THRESHOLD, "Stale price");
+        // AUDIT FIX (BUG-23): Reject stale carried-over oracle answers
+        require(answeredInRound >= roundId, "Stale answer");
+
+        price = uint256(rawPrice) * (10 ** 10);
+    }
+
+    /// @notice AUDIT FIX (MEDIUM-6): Non-reverting BNB price fetch. Returns 0 if feed is stale/unavailable.
+    function tryGetLatestBNBPrice() public view returns (uint256 price) {
+        try bnbPriceFeed.latestRoundData() returns (
+            uint80 roundId, int256 rawPrice, uint256, uint256 updatedAt, uint80 answeredInRound
+        ) {
+            if (rawPrice <= 0 || roundId == 0 || updatedAt == 0 || updatedAt > block.timestamp) return 0;
+            if (block.timestamp - updatedAt > STALENESS_THRESHOLD) return 0;
+            if (answeredInRound < roundId) return 0;
+            price = uint256(rawPrice) * (10 ** 10);
+        } catch {
+            return 0;
+        }
+    }
+
+    /**
+     * @notice Calculate bonding curve parameters to match four.meme pricing exactly.
+     * LOT-09 (Audit): bnbPriceUSD is fetched and returned for off-chain use; P0/m are BNB-denominated (fixed targets), not dynamically derived from USD here.
+     * AUDIT NOTE (BUG-24): P0 and m are BNB-denominated constants — they do NOT vary with BNB/USD price.
+     * The Chainlink feed is used only to return bnbPriceUSD as informational metadata. START_MARKET_CAP_USD
+     * and END_MARKET_CAP_USD are reference documentation only and are not used in calculations.
+     * @dev Uses multiple target points to calculate m accurately:
+     *      - 0.00099 BNB → 170,734 tokens
+     *      - 0.0099 BNB → 1,704,902 tokens
+     *      - 0.099 BNB → 16,808,861 tokens
+     *      - 0.99 BNB → 147,334,426 tokens
+     *      
+     *      The formula: Cost = P0*s + 0.5*m*s^2/curveAllocation
+     *      Solving for m using the largest point (0.99 BNB) for accuracy
+     * @return p0_wad Starting price in BNB wei per token (WAD scaled)
+     * @return m_wad Slope in BNB wei per token per token (WAD scaled)
+     * @return bnbPriceUSD Current BNB price in USD (WAD scaled, 18 decimals)
+     */
+    function calculateCurveParams() public view returns (
+        uint256 p0_wad,
+        uint256 m_wad,
+        uint256 bnbPriceUSD
+    ) {
+        // AUDIT FIX (MEDIUM-6): Use non-reverting price fetch. P0 and m are fixed BNB-denominated
+        // constants that don't depend on the price. The feed is informational only — a stale feed
+        // should not block curve creation.
+        bnbPriceUSD = tryGetLatestBNBPrice();
+        
+        // Set P0 directly to target initial price: 5.798e-9 BNB per token (matching four.meme)
+        // P0 = 5798 / 1e12 * 1e18 = 5798 * 1e6 = 5798000000 (in WAD)
+        p0_wad = (TARGET_P0_BNB_NUMERATOR * WAD) / TARGET_P0_BNB_DENOMINATOR;
+        
+        // Calculate m to match the expected token amounts at initial state (s=0)
+        // Expected: 0.99 BNB → 147,334,426 tokens
+        // New formula: P(s) = P0 + (m * s) / curveAllocation
+        // Cost from s=0: Cost = (P0 * ds) / WAD + (m * ds^2) / (2 * curveAllocation * WAD)
+        // Note: m is stored as m_wad (already in WAD units), so m = m_wad
+        // Solving for m_wad: (m_wad * ds^2) / (2 * curveAllocation * WAD) = Cost - (P0 * ds) / WAD
+        // m_wad * ds^2 = 2 * (Cost - (P0 * ds) / WAD) * curveAllocation * WAD
+        // m_wad = 2 * (Cost - (P0 * ds) / WAD) * curveAllocation * WAD / ds^2
+        uint256 targetTokensSold = 147_334_426 * (10 ** 18); // In raw token units (WAD)
+        uint256 targetCostWei = 99 * (10 ** 16); // 0.99 BNB net (after 1% fee from 1 BNB input)
+        // AUDIT FIX (BROKEN-1): Use 80% of total supply to match actual funded amount
+        uint256 curveAllocation = (TOTAL_TOKENS * (10 ** 18) * CURVE_PERCENT) / 100;
+        
+        // P0 term: (P0 * ds) / WAD (in wei)
+        uint256 p0TermWei = (p0_wad * targetTokensSold) / WAD;
+        
+        // Calculate m if there's a cost difference
+        if (targetCostWei > p0TermWei && targetTokensSold > 0 && curveAllocation > 0) {
+            uint256 costDiffWei = targetCostWei - p0TermWei;
+            
+            // Calculate ds^2 to avoid overflow
+            // ds = 147334426 * 10^18
+            // ds^2 = (147334426 * 10^18)^2 = 147334426^2 * 10^36
+            // We need: m_wad = 2 * costDiffWei * curveAllocation * WAD / ds^2
+            
+            uint256 twoCostDiff = 2 * costDiffWei;
+            
+            // Calculate step by step to avoid overflow
+            // m_wad = (2 * costDiff * curveAllocation * WAD) / ds^2
+            // ds^2 = targetTokensSold^2 (36 decimals)
+            // To avoid calculating huge ds^2, use: dsSquared = (ds/WAD)^2 (no decimals)
+            // Then ds^2 = dsSquared * WAD^2
+            // So: m_wad = (2 * costDiff * curveAllocation * WAD) / (dsSquared * WAD^2)
+            // = (2 * costDiff * curveAllocation) / (dsSquared * WAD)
+            
+            uint256 dsSquared = (targetTokensSold / WAD) * (targetTokensSold / WAD); // (ds/WAD)^2, no decimals
+            if (dsSquared == 0) dsSquared = 1; // Avoid division by zero
+            
+            // Calculate: (2 * costDiff * curveAllocation) / (dsSquared * WAD)
+            if (twoCostDiff <= type(uint256).max / curveAllocation) {
+                uint256 numerator = twoCostDiff * curveAllocation; // 18 + 18 = 36 decimals
+                // Divide by (dsSquared * WAD)
+                if (dsSquared <= type(uint256).max / WAD) {
+                    uint256 denominator = dsSquared * WAD; // 0 + 18 = 18 decimals
+                    m_wad = numerator / denominator; // 36 - 18 = 18 decimals (WAD) ✓
+                } else {
+                    // Divide numerator by WAD first, then by dsSquared
+                    uint256 numeratorOverWad = numerator / WAD; // 36 - 18 = 18 decimals
+                    m_wad = numeratorOverWad / dsSquared; // 18 - 0 = 18 decimals (WAD) ✓
+                }
+            } else {
+                // Divide costDiff first to avoid overflow
+                // Calculate: (2 * costDiff) / dsSquared, then * curveAllocation, then / WAD
+                uint256 quotient = twoCostDiff / dsSquared;
+                if (quotient > 0 && quotient <= type(uint256).max / curveAllocation) {
+                    uint256 temp = quotient * curveAllocation; // 0 + 18 = 18 decimals
+                    m_wad = temp / WAD; // 18 - 18 = 0 decimals... wait that's wrong!
+                    // Actually, we need: m_wad = (2 * costDiff * curveAllocation) / (dsSquared * WAD)
+                    // = ((2 * costDiff) / dsSquared) * curveAllocation / WAD
+                    // But (2 * costDiff) / dsSquared might lose precision
+                    // Better: calculate (2 * costDiff * curveAllocation) first, then divide
+                    // If that overflows, use alternative method
+                    uint256 costDiffTimesCurveAlloc = costDiffWei * curveAllocation;
+                    if (costDiffTimesCurveAlloc <= type(uint256).max / 2) {
+                        uint256 numerator = costDiffTimesCurveAlloc * 2; // 18 + 18 = 36 decimals
+                        if (dsSquared <= type(uint256).max / WAD) {
+                            m_wad = numerator / (dsSquared * WAD); // 36 - 18 = 18 decimals ✓
+                        } else {
+                            m_wad = (numerator / WAD) / dsSquared; // (36-18) - 0 = 18 decimals ✓
+                        }
+                    } else {
+                        m_wad = 0; // Would overflow
+                    }
+                } else {
+                    m_wad = 0; // Would overflow
+                }
+            }
+        } else {
+            m_wad = 0;
+        }
+    }
+
+    /// @notice LOT-33 (Audit Round 2): Only owner or authorized callers (e.g. TokenFactory) can deploy curves.
+    function setAuthorizedCaller(address caller, bool authorized) external onlyOwner {
+        authorizedCallers[caller] = authorized;
+        emit AuthorizedCallerSet(caller, authorized);
+    }
+
+    /**
+     * @notice Create a bonding curve for a token
+     * LOT-33 (Audit Round 2): onlyAuthorized — register TokenFactory via setAuthorizedCaller(factory, true) after deploy.
+     * @param _token Token address
+     * @param _tokenDecimals Token decimals (usually 18)
+     * @param _owner Owner of the bonding curve
+     * @return bondingCurve Address of the deployed bonding curve
+     */
+    function createBondingCurve(
+        address _token,
+        uint8 _tokenDecimals,
+        address _owner,
+        address _migrator
+    ) external onlyAuthorized returns (address bondingCurve) {
+        require(_token != address(0), "token 0");
+        require(_owner != address(0), "owner 0");
+        // LOT-19 (Audit): Bonding curve math assumes 18-decimal tokens
+        require(_tokenDecimals == 18, "bonding curves require 18 decimals");
+
+        // Calculate curve parameters using real-time BNB price from Chainlink
+        (uint256 p0_wad, uint256 m_wad, uint256 bnbPriceUSD) = calculateCurveParams();
+        // AUDIT FIX (BROKEN-1): curveAllocation = 80% of total supply, matching what TokenFactory actually funds.
+        // The remaining 20% goes to the creator for DEX LP seeding after curve finishes.
+        uint256 curveAllocation = (TOTAL_TOKENS * (10 ** _tokenDecimals) * CURVE_PERCENT) / 100;
+
+        BondingCurveBNB curve = new BondingCurveBNB(
+            _token,
+            p0_wad,
+            m_wad,
+            curveAllocation,
+            feeRecipient,
+            _owner,
+            _migrator
+        );
+
+        bondingCurve = address(curve);
+        emit BondingCurveCreated(_token, bondingCurve, p0_wad, m_wad, curveAllocation, bnbPriceUSD);
+    }
+}
+

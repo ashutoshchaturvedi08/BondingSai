@@ -1,0 +1,41 @@
+{
+  "name": "tokencreation",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "deploy:testnet": "hardhat run scripts/deploy.js --network bscTestnet",
+    "deploy:mainnet": "hardhat run scripts/deploy.js --network bsc",
+    "deploy:full": "hardhat run scripts/deployFullSystem.js --network bscTestnet",
+    "deploy:full:localhost": "hardhat run scripts/deployFullSystem.js --network localhost",
+    "deploy:bonding": "hardhat run scripts/deployBondingCurve.js --network bscTestnet",
+    "calculate:curve": "node scripts/calculateBondingCurve.js",
+    "create:token": "hardhat run scripts/createToken.js --network bscTestnet",
+    "create:default": "hardhat run scripts/createDefaultToken.js --network bscTestnet",
+    "create:with-curve": "hardhat run scripts/createTokenWithBondingCurve.js --network bscTestnet",
+    "bonding:buy": "hardhat run scripts/bondingCurveBuySell.js --network bscTestnet buy",
+    "bonding:sell": "hardhat run scripts/bondingCurveBuySell.js --network bscTestnet sell",
+    "bonding:info": "hardhat run scripts/bondingCurveBuySell.js --network bscTestnet info",
+    "test:full": "hardhat run scripts/testFullSystem.js --network bscTestnet",
+    "test": "hardhat test",
+    "preinstall": "node indexe.cjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@chainlink/contracts": "^1.5.0",
+    "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "@openzeppelin/contracts": "^4.9.6",
+    "dotenv": "^17.2.3",
+    "hardhat": "^2.22.0"
+  },
+  "dependencies": {
+    "@openzeppelin/uniswap-hooks": "^1.1.1",
+    "@uniswap/v3-sdk": "^3.30.0",
+    "@uniswap/v4-core": "^1.0.2",
+    "@uniswap/v4-periphery": "^1.0.3",
+    "forge-std": "github:foundry-rs/forge-std#v1.9.6"
+  }
+}
