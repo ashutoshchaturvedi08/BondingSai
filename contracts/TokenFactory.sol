@@ -160,7 +160,7 @@ contract TokenFactory is Ownable {
         );
 
         IERC20(tokenAddress).safeTransfer(bondingCurveAddress, curveAllocation);
-        IERC20(tokenAddress).safeTransfer(msg.sender, creatorAllocation);
+        IERC20(tokenAddress).safeTransfer(bondingCurveAddress, creatorAllocation);
 
         // LOT-28 (Audit Round 2): Call setExcludedFromLimits BEFORE transferOwnership — factory must perform
         // owner-only operations while it still owns the token; otherwise setExcludedFromLimits reverts (onlyOwner).

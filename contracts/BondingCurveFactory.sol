@@ -38,7 +38,7 @@ contract BondingCurveFactory is Ownable {
     //   - 0.0099 BNB → 1,704,902 tokens
     //   - 0.099 BNB → 16,808,861 tokens
     //   - 0.99 BNB → 147,334,426 tokens
-    uint256 public constant TARGET_P0_BNB_NUMERATOR = 5798; // 0.000000005798 = 5798 / 1e12
+    uint256 public constant TARGET_P0_BNB_NUMERATOR = 1798; // 0.000000005798 = 5798 / 1e12
     uint256 public constant TARGET_P0_BNB_DENOMINATOR = 1e12;
     uint256 public constant WAD = 1e18;
     uint256 public constant PRICE_FEED_DECIMALS = 8; // Chainlink price feeds use 8 decimals

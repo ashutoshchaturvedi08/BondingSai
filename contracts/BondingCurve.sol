@@ -38,6 +38,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     uint256 public immutable curveAllocation; // total tokens allocated to this curve (raw units)
     bool public curveFinished;
     address public migrator;
+    bool public isMigrated;
 
     modifier onlyMigrator() {
         _onlyMigrator();
@@ -335,21 +336,22 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
 
     // --- Admin / deposits ---
 
-    /// owner must pre-fund the curve with tokens
-    /// LOT-31 (Audit Round 2): Use SafeERC20 for compatibility with non-standard ERC-20 (e.g. USDT that doesn't return bool)
-    function depositCurveTokens(
-        uint256 amount
-    ) external nonReentrant onlyOwner {
-        require(amount > 0, "amount>0");
-        token.safeTransferFrom(msg.sender, address(this), amount);
-        emit DepositedTokens(msg.sender, amount);
-    }
+    // /// owner must pre-fund the curve with tokens
+    // /// LOT-31 (Audit Round 2): Use SafeERC20 for compatibility with non-standard ERC-20 (e.g. USDT that doesn't return bool)
+    // function depositCurveTokens(
+    //     uint256 amount
+    // ) external nonReentrant onlyOwner {
+    //     require(amount > 0, "amount>0");
+    //     token.safeTransferFrom(msg.sender, address(this), amount);
+    //     emit DepositedTokens(msg.sender, amount);
+    // }
 
     // Fee recipient is immutable, cannot be changed
 
     // LOT-06 (Audit): Withdraw only excess tokens. LOT-34: Owner can withdraw above active allocation; trust assumption.
     function withdrawToken(address to, uint256 amount) external onlyOwner {
         require(to != address(0), "zero");
+        require(isMigrated,"bonding not migrated yet");
         uint256 activeBalance = curveAllocation - sold;
         uint256 currentBalance = token.balanceOf(address(this));
         require(
@@ -377,6 +379,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         uint256 amount
     ) external onlyOwner nonReentrant {
         require(to != payable(address(0)), "zero");
+        require(isMigrated,"bonding not migrated yet");
         require(amount <= address(this).balance, "insufficient balance");
         uint256 grossRequired = sellQuoteFor(sold, sold);
         uint256 requiredBNB = grossRequired > totalSellFeesExtracted
@@ -523,6 +526,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
     /// AUDIT FIX (CRITICAL-3): nonReentrant prevents reentrancy via .call{value} callback.
     function migrateLiquidity() external onlyMigrator nonReentrant {
         require(curveFinished, "not finished");
+        require(!isMigrated, "already migrated");
         require(curveFinishedAt > 0, "finishedAt not set");
         require(
             block.timestamp >= curveFinishedAt + MIGRATION_DELAY,
@@ -537,6 +541,7 @@ contract BondingCurveBNB is Ownable, ReentrancyGuard {
         require(ok, "transfer failed");
         // 4. Transfer tokens
         IERC20(token).transfer(migrator, tokenBalance);
+        isMigrated = true;
         emit LiquidityMigrated(migrator, balance);
     }
 
